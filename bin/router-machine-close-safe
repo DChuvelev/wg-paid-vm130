@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "$#" -eq 2 ]] || { echo 'Usage: router-machine-close-safe {vm100|vm101|vm121|vm130} "description"'; exit 2; }
+raw="$1"; description="$2"; machine="${raw,,}"
+case "$machine" in vm100|vm101|vm121|vm130) ;; *) echo RESULT=STOP_ROUTER_MACHINE_CLOSE_SAFE_MACHINE; echo "MACHINE=$raw"; exit 2;; esac
+[[ -n "$description" ]] || { echo RESULT=STOP_ROUTER_MACHINE_CLOSE_SAFE_DESCRIPTION; exit 2; }
+bin="${ROUTER_MACHINE_CLOSE_BIN:-/opt/router-ops/bin/router-machine-close}"
+[[ -x "$bin" ]] || { echo RESULT=STOP_ROUTER_MACHINE_CLOSE_SAFE_HELPER_MISSING; exit 2; }
+"$bin" "$machine" "$description"

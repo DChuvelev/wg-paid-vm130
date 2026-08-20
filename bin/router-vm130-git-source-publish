@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+MODE="${1:---check}"
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+PUBLIC_BASE="${ROUTER_PUBLIC_BASE_URL:-https://reports.secret-studio.ru}"; PUBLIC_BASE="${PUBLIC_BASE%/}"
+REPOSITORY_URL="file:///opt/router-ops/state/source-remotes/wg-paid-vm130.git"
+REPO_DIR="$BASE/state/source-repositories/wg-paid-vm130"
+STATE_FILE="$BASE/state/current-vm130-git-source.env"
+PUBLISH_TOOL="$BASE/bin/router-publish-report"
+PUBLICATION_CONTRACT_LIB="$BASE/lib/router-publication-contract.sh"
+HTTP_VERIFY_TOOL="$BASE/bin/router-http-verify"
+LOCAL_PUBLISHER="$BASE/bin/router-vm130-git-publish"
+LOCK_DIR="$BASE/state/locks"
+LOCK_FILE="$LOCK_DIR/vm130-git-source-publish.lock"
+TMPDIR_RUN="$(mktemp -d /tmp/vm130-git-source-publish.XXXXXX)"
+VM130_OUTPUT="$TMPDIR_RUN/vm130-publish.txt"
+cleanup(){ rm -rf "$TMPDIR_RUN"; }
+trap cleanup EXIT INT TERM
+log(){ echo ">>> [vm130-source] $*"; }
+stop(){ echo "STOP=$*"; exit 1; }
+case "$MODE" in --check|--publish) ;; *) echo "Usage: $0 --check"; echo "       $0 --publish"; exit 2;; esac
+mkdir -p "$(dirname "$REPO_DIR")" "$LOCK_DIR"
+exec 9>"$LOCK_FILE"; flock -n 9 || stop ANOTHER_VM130_SOURCE_PUBLISH_IS_RUNNING
+for c in git tar gzip sha256sum python3 flock; do command -v "$c" >/dev/null 2>&1 || stop "COMMAND_MISSING_$c"; done
+test -x "$PUBLISH_TOOL"; test -r "$PUBLICATION_CONTRACT_LIB"; test -x "$HTTP_VERIFY_TOOL"; test -x "$LOCAL_PUBLISHER"
+echo "MODE=$MODE"; echo "REPOSITORY_URL=$REPOSITORY_URL"; echo "REPO_DIR=$REPO_DIR"
+log "run VM130 local Machine Git publisher"
+set +e
+"$LOCAL_PUBLISHER" "$MODE" > "$VM130_OUTPUT" 2>&1
+LOCAL_RC=$?
+set -e
+cat "$VM130_OUTPUT"
+echo "VM130_LOCAL_PUBLISHER_RC=$LOCAL_RC"
+[[ "$LOCAL_RC" -eq 0 ]] || stop "VM130_GIT_PUBLISHER_FAILED_RC_$LOCAL_RC"
+VM130_COMMIT="$(awk -F= '/^GIT_COMMIT=/{v=$2} /^LOCAL_HEAD=/{if(v=="")v=$2} END{print v}' "$VM130_OUTPUT")"
+VM130_REMOTE_COMMIT="$(awk -F= '/^REMOTE_COMMIT=/{v=$2} /^REMOTE_HEAD=/{if(v=="")v=$2} END{print v}' "$VM130_OUTPUT")"
+[[ "$VM130_COMMIT" =~ ^[0-9a-f]{40}$ ]] || stop "INVALID_VM130_COMMIT_$VM130_COMMIT"
+[[ -z "$VM130_REMOTE_COMMIT" || "$VM130_REMOTE_COMMIT" == "$VM130_COMMIT" ]] || stop VM130_LOCAL_REMOTE_COMMIT_MISMATCH
+log "clone or refresh exact VM130 mirror checkout"
+if [[ ! -d "$REPO_DIR/.git" ]]; then
+  rm -rf "$REPO_DIR"; git clone --branch main "$REPOSITORY_URL" "$REPO_DIR"
+else
+  CURRENT_ORIGIN="$(git -C "$REPO_DIR" remote get-url origin)"; echo "CURRENT_ORIGIN=$CURRENT_ORIGIN"
+  [[ "$CURRENT_ORIGIN" == "$REPOSITORY_URL" ]] || stop "UNEXPECTED_REPOSITORY_ORIGIN_$CURRENT_ORIGIN"
+  git -C "$REPO_DIR" fetch --prune origin main
+  git -C "$REPO_DIR" checkout -B main origin/main
+  git -C "$REPO_DIR" reset --hard origin/main
+  git -C "$REPO_DIR" clean -fdx
+fi
+CLONE_COMMIT="$(git -C "$REPO_DIR" rev-parse HEAD)"
+CLONE_TREE="$(git -C "$REPO_DIR" show -s --format=%T HEAD)"
+CLONE_FILE_COUNT="$(git -C "$REPO_DIR" ls-tree -r --full-tree --name-only HEAD | awk 'END{print NR+0}')"
+CLONE_STATUS="$(git -C "$REPO_DIR" status --porcelain)"
+echo "VM130_COMMIT=$CLONE_COMMIT"; echo "VM130_TREE=$CLONE_TREE"; echo "VM130_FILE_COUNT=$CLONE_FILE_COUNT"; echo "VM130_STATUS=${CLONE_STATUS:-CLEAN}"
+[[ "$CLONE_COMMIT" == "$VM130_COMMIT" && -z "$CLONE_STATUS" ]] || stop VM130_CLONE_IDENTITY_OR_STATUS_MISMATCH
+for p in etc/router-machine-git-source.conf bin/router-machine-git-publish bin/router-vm130-git-publish bin/router-vm130-git-source-publish; do [[ -f "$REPO_DIR/$p" ]] || stop "REQUIRED_PATH_MISSING_$p"; echo "REQUIRED_PATH_OK=$p"; done
+if [[ "$MODE" == --check ]]; then
+  echo RESULT=PASS_VM130_VM130_GIT_SOURCE_CHECK
+  echo "VM130_COMMIT=$CLONE_COMMIT"; echo "VM130_TREE=$CLONE_TREE"; echo "VM130_FILE_COUNT=$CLONE_FILE_COUNT"
+  echo VM130_PUSH_PERFORMED=false; echo ARCHIVE_CREATED=false; echo PERMANENT_HTTPS_PUBLISHED=false
+  exit 0
+fi
+log "create complete archive and metadata from exact Git commit"
+SHORT_COMMIT="${CLONE_COMMIT:0:12}"; GENERATED_AT_UTC="$(date -u +%Y%m%d-%H%M%S)"
+ARCHIVE_NAME="wg-paid-vm130-${SHORT_COMMIT}.tar.gz"; ARCHIVE="$TMPDIR_RUN/$ARCHIVE_NAME"; ARCHIVE_SHA_FILE="$TMPDIR_RUN/${ARCHIVE_NAME}.sha256"
+ARCHIVE_B64_NAME="${ARCHIVE_NAME}.b64.txt"; ARCHIVE_B64="$TMPDIR_RUN/$ARCHIVE_B64_NAME"
+MANIFEST="$TMPDIR_RUN/git-tree-manifest.txt"; PATHS="$TMPDIR_RUN/managed-paths.txt"; COMMIT_INFO="$TMPDIR_RUN/git-commit.txt"; FACTS="$TMPDIR_RUN/facts.json"
+git -C "$REPO_DIR" archive --format=tar.gz --prefix="wg-paid-vm130-${SHORT_COMMIT}/" "$CLONE_COMMIT" > "$ARCHIVE"
+sha256sum "$ARCHIVE" > "$ARCHIVE_SHA_FILE"
+python3 - "$ARCHIVE" "$ARCHIVE_B64" <<'PYB64'
+import base64,pathlib,sys,textwrap
+s=pathlib.Path(sys.argv[1]); o=pathlib.Path(sys.argv[2]); e=base64.b64encode(s.read_bytes()).decode('ascii')
+with o.open('w',encoding='ascii',newline='\n') as f:
+    for line in textwrap.wrap(e,76): f.write(line+'\n')
+PYB64
+git -C "$REPO_DIR" ls-tree -r --full-tree "$CLONE_COMMIT" > "$MANIFEST"
+git -C "$REPO_DIR" ls-tree -r --full-tree --name-only "$CLONE_COMMIT" > "$PATHS"
+git -C "$REPO_DIR" show -s --format=fuller "$CLONE_COMMIT" > "$COMMIT_INFO"
+ARCHIVE_SHA256="$(awk '{print $1}' "$ARCHIVE_SHA_FILE")"
+python3 - "$FACTS" "$GENERATED_AT_UTC" "$REPOSITORY_URL" "$CLONE_COMMIT" "$CLONE_TREE" "$CLONE_FILE_COUNT" "$ARCHIVE_NAME" "$ARCHIVE_SHA256" "$ARCHIVE_B64_NAME" <<'PYFACTS'
+import json,sys
+out,ts,repo,commit,tree,count,archive,sha,b64=sys.argv[1:]
+facts={'result':'PASS_VM130_GIT_SOURCE_ARCHIVE','generated_at_utc':ts,'repository':repo,'branch':'main','commit':commit,'tree':tree,'file_count':int(count),'archive':archive,'archive_sha256':sha,'archive_base64_transport':b64,'archive_base64_encoding':'base64','archive_base64_decodes_to':archive,'source_contract':'VM130 live worktree -> VM130 bare Machine Git commit -> local bare mirror main -> VM130 exact checkout -> Git archive'}
+open(out,'w',encoding='utf-8').write(json.dumps(facts,ensure_ascii=False,indent=2)+'\n')
+PYFACTS
+log "publish atomically into canonical latest vm130-source"
+LABEL="vm130_git_source_${SHORT_COMMIT}"; PUBLISH_OUTPUT_FILE="$TMPDIR_RUN/publish-output.txt"
+set +e
+"$PUBLISH_TOOL" "$LABEL" "$ARCHIVE" "$ARCHIVE_SHA_FILE" "$ARCHIVE_B64" "$MANIFEST" "$PATHS" "$COMMIT_INFO" "$FACTS" "$VM130_OUTPUT" > "$PUBLISH_OUTPUT_FILE" 2>&1
+PUBLISHER_RC=$?
+set -e
+cat "$PUBLISH_OUTPUT_FILE"
+source "$PUBLICATION_CONTRACT_LIB"
+EXPECTED_KIND=vm130-source; PUBLISHER_RC_NONZERO_SALVAGED=false
+router_publication_contract_load "$PUBLISH_OUTPUT_FILE" "$EXPECTED_KIND" || stop "PUBLISHER_OUTPUT_CONTRACT_INVALID_RC_$PUBLISHER_RC"
+[[ "$PUBLISHER_RC" -eq 0 ]] || PUBLISHER_RC_NONZERO_SALVAGED=true
+PUBLISHED_DIR="$RPC_PUBLISHED_DIR"; PUBLISHED_RELATIVE_PATH="$RPC_PUBLISHED_RELATIVE_PATH"; SOURCE_URL="$RPC_PUBLIC_URL"; EXPECTED_SOURCE_URL="${PUBLIC_BASE}/${PUBLISHED_RELATIVE_PATH%/}/"
+[[ "$SOURCE_URL" == "$EXPECTED_SOURCE_URL" ]] || stop "INVALID_PERMANENT_SOURCE_URL_$SOURCE_URL"
+case "$PUBLISHED_DIR" in "$BASE"/public/r/*/latest/*) ;; *) stop "INVALID_PUBLISHED_DIR_$PUBLISHED_DIR";; esac
+[[ -f "$PUBLISHED_DIR/$ARCHIVE_NAME" && -f "$PUBLISHED_DIR/$ARCHIVE_B64_NAME" && -f "$PUBLISHED_DIR/facts.json" && -f "$PUBLISHED_DIR/git-tree-manifest.txt" && -f "$PUBLISHED_DIR/managed-paths.txt" ]] || stop PUBLISHED_REQUIRED_FILES_MISSING
+router_publication_verify_file "$PUBLISHED_DIR/$ARCHIVE_NAME" "$ARCHIVE_SHA256" || stop PUBLISHED_ARCHIVE_SHA_MISMATCH
+PUBLISHED_PATH_COUNT="$(wc -l < "$PUBLISHED_DIR/managed-paths.txt" | tr -d ' ')"; [[ "$PUBLISHED_PATH_COUNT" == "$CLONE_FILE_COUNT" ]] || stop PUBLISHED_PATH_COUNT_MISMATCH
+FACTS_SHA256="$(sha256sum "$PUBLISHED_DIR/facts.json"|awk '{print $1}')"; MANIFEST_SHA256="$(sha256sum "$PUBLISHED_DIR/git-tree-manifest.txt"|awk '{print $1}')"
+ARCHIVE_URL="${SOURCE_URL}${ARCHIVE_NAME}"; ARCHIVE_B64_URL="${SOURCE_URL}${ARCHIVE_B64_NAME}"; FACTS_URL="${SOURCE_URL}facts.json"; MANIFEST_URL="${SOURCE_URL}git-tree-manifest.txt"
+HTTP_LOG="$TMPDIR_RUN/http-postcheck.log"; : > "$HTTP_LOG"
+"$HTTP_VERIFY_TOOL" --url "$SOURCE_URL" --output "$TMPDIR_RUN/http-index.html" >> "$HTTP_LOG" 2>&1 || stop HTTP_INDEX_VERIFY_FAILED
+"$HTTP_VERIFY_TOOL" --url "$ARCHIVE_URL" --output "$TMPDIR_RUN/http-archive.tar.gz" --sha256 "$ARCHIVE_SHA256" >> "$HTTP_LOG" 2>&1 || stop HTTP_ARCHIVE_VERIFY_FAILED
+"$HTTP_VERIFY_TOOL" --url "$FACTS_URL" --output "$TMPDIR_RUN/http-facts.json" --sha256 "$FACTS_SHA256" >> "$HTTP_LOG" 2>&1 || stop HTTP_FACTS_VERIFY_FAILED
+"$HTTP_VERIFY_TOOL" --url "$MANIFEST_URL" --output "$TMPDIR_RUN/http-manifest.txt" --sha256 "$MANIFEST_SHA256" >> "$HTTP_LOG" 2>&1 || stop HTTP_MANIFEST_VERIFY_FAILED
+cat "$HTTP_LOG"
+STATE_TMP="${STATE_FILE}.tmp.$$"
+{
+ echo "VM130_GIT_SOURCE_UPDATED_AT_UTC=$GENERATED_AT_UTC"; echo "VM130_GIT_SOURCE_REPOSITORY=$REPOSITORY_URL"; echo VM130_GIT_SOURCE_BRANCH=main
+ echo "VM130_GIT_SOURCE_COMMIT=$CLONE_COMMIT"; echo "VM130_GIT_SOURCE_TREE=$CLONE_TREE"; echo "VM130_GIT_SOURCE_FILE_COUNT=$CLONE_FILE_COUNT"
+ echo "VM130_GIT_SOURCE_PUBLIC_DIR=$PUBLISHED_DIR"; echo "VM130_GIT_SOURCE_URL=$SOURCE_URL"; echo "VM130_GIT_SOURCE_ARCHIVE_URL=$ARCHIVE_URL"; echo "VM130_GIT_SOURCE_ARCHIVE_B64_URL=$ARCHIVE_B64_URL"; echo "VM130_GIT_SOURCE_FACTS_URL=$FACTS_URL"; echo "VM130_GIT_SOURCE_MANIFEST_URL=$MANIFEST_URL"; echo "VM130_GIT_SOURCE_ARCHIVE_SHA256=$ARCHIVE_SHA256"
+} > "$STATE_TMP"
+chmod 600 "$STATE_TMP"; mv -f "$STATE_TMP" "$STATE_FILE"
+echo RESULT=PASS_VM130_VM130_GIT_SOURCE_PUBLISH
+for kv in "VM130_GIT_SOURCE_COMMIT=$CLONE_COMMIT" "VM130_GIT_SOURCE_TREE=$CLONE_TREE" "VM130_GIT_SOURCE_FILE_COUNT=$CLONE_FILE_COUNT" "VM130_GIT_SOURCE_URL=$SOURCE_URL" "VM130_GIT_SOURCE_ARCHIVE_URL=$ARCHIVE_URL" "VM130_GIT_SOURCE_ARCHIVE_B64_URL=$ARCHIVE_B64_URL" "VM130_GIT_SOURCE_FACTS_URL=$FACTS_URL" "VM130_GIT_SOURCE_MANIFEST_URL=$MANIFEST_URL" "VM130_GIT_SOURCE_ARCHIVE_SHA256=$ARCHIVE_SHA256"; do echo "$kv"; done
+echo VM130_PUSH_PERFORMED=true; echo ARCHIVE_CREATED=true; echo "PUBLISHER_RESULT=$RPC_RESULT"; echo "PUBLISHER_RC=$PUBLISHER_RC"; echo "PUBLISHER_RC_NONZERO_SALVAGED=$PUBLISHER_RC_NONZERO_SALVAGED"; echo PUBLICATION_COMMITTED=true; echo LOCAL_POSTCHECK=PASS; echo LATEST_INDEX_CONTAINS_FOLDER=true; echo HTTP_POSTCHECK=PASS; echo SOURCE_STATE_UPDATED=true; echo PERMANENT_HTTPS_PUBLISHED=true

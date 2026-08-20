@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+INV="${ROUTER_OPS_INVENTORY:-/opt/router-ops/inventory.tsv}"
+
+if [ ! -f "$INV" ]; then
+  echo "Inventory not found: $INV" >&2
+  exit 1
+fi
+
+awk -F'|' '
+  /^[[:space:]]*#/ || NF < 4 { next }
+  {
+    printf "%-20s %-18s %-8s %-6s %s\n", $1, $2, $3, $4, $5
+  }
+' "$INV"

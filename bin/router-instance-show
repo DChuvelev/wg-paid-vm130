@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+
+INSTANCE="${1:-mgts-main}"
+BASE="/opt/router-ops/instances/$INSTANCE"
+
+if [ ! -d "$BASE" ]; then
+  echo "No such instance: $INSTANCE" >&2
+  exit 1
+fi
+
+echo "INSTANCE=$INSTANCE"
+echo "BASE=$BASE"
+echo
+
+for f in instance.yml hosts.yml networks.yml egress.yml secrets.env.example README.md; do
+  if [ -f "$BASE/$f" ]; then
+    echo "################################################################"
+    echo "### $f"
+    echo "################################################################"
+    sed -n '1,260p' "$BASE/$f"
+    echo
+  fi
+done

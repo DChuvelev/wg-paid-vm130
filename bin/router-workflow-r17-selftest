@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"; T="${1:-$BASE/state/r17-selftest.$$.d}"; rm -rf "$T"; mkdir -p "$T/base/bin" "$T/base/lib" "$T/base/public/r/token/latest" "$T/base/public/r/token/old" "$T/base/state"
+cp "$BASE/bin/router-publish-report" "$T/base/bin/"; cp "$BASE/bin/router-public-safe-payload" "$T/base/bin/"; cp "$BASE/bin/router-public-html-aliases" "$T/base/bin/"; cp "$BASE/bin/router-step-lineage" "$T/base/bin/"; cp "$BASE/lib/router-publication-policy.sh" "$T/base/lib/"; cp "$BASE/lib/router-contract-normalize.sh" "$T/base/lib/"; cp "$BASE/lib/router-step-workflow.sh" "$T/base/lib/"; echo token > "$T/base/public/.router-public-token"
+cat > "$T/base/bin/router-public-reindex" <<'SH'
+#!/usr/bin/env bash
+set -e
+B="${ROUTER_OPS_BASE:?}"; TKN="$(cat "$B/public/.router-public-token")"; R="$B/public/r/$TKN"; for z in latest old; do { echo '<html><body>'; find "$R/$z" -mindepth 1 -maxdepth 1 -type d -printf '%f
+'|sort|while read -r n; do echo "$n/"; done; echo '</body></html>'; } > "$R/$z/index.html"; done
+SH
+chmod 700 "$T/base/bin/router-public-reindex"
+export ROUTER_OPS_BASE="$T/base" ROUTER_PUBLIC_TOKEN=token ROUTER_PUBLIC_ROOT="$T/base/public/r/token" ROUTER_PUBLIC_REINDEX="$T/base/bin/router-public-reindex" ROUTER_PUBLICATION_POLICY_LIB="$T/base/lib/router-publication-policy.sh"
+"$T/base/bin/router-publish-report" --classify project_source_post_vm101_any > "$T/classify"; grep -Fqx 'PUBLIC_OBJECT_KIND=project-source-post' "$T/classify"
+source "$T/base/lib/router-contract-normalize.sh"; router_contract_bool_is_true True; router_contract_bool_is_true 1; ! router_contract_bool_is_true false
+printf ok > "$T/a.txt"; "$T/base/bin/router-publish-report" --preflight local_architecture_plan_vm101_autonomous_hmn_recovery_r17 "$T/a.txt" > "$T/pre"; grep -Fqx 'PUBLIC_OBJECT_KIND=local-m07-plan' "$T/pre"
+printf bad > "$T/x.env"; if "$T/base/bin/router-publish-report" --preflight step_test "$T/x.env" >/dev/null 2>&1; then exit 1; fi
+mkdir -p "$T/payload"; "$T/base/bin/router-public-safe-payload" "$T/payload" "$T/a.txt" phase-current.txt >/dev/null
+cat > "$T/facts.json" <<EOF
+{"result":"PASS"}
+EOF
+printf PASS > "$T/verify.txt"; printf rollback > "$T/rollback.sh"; chmod 644 "$BASE/bin/router-public-html-aliases"; python3 "$BASE/bin/router-public-html-aliases" --facts "$T/facts.json" --verify "$T/verify.txt" --rollback "$T/rollback.sh" --output-dir "$T/html" --title-prefix R17 >/dev/null; [[ -f "$T/html/facts-public.html" ]]
+CUR="$T/current"; EVT="$T/events"; source "$T/base/lib/router-step-workflow.sh"; router_step_workflow_init "$CUR" "$EVT" one; router_step_phase_complete one; router_step_publication_barrier_mark_verified test; router_step_should_publish_stop && exit 1; router_step_error_classification STOP_TEST phase 1 1 | grep -Fqx 'NO_SECOND_STOP_REPORT=true'
+mkdir -p "$T/base/public/r/token/latest/one"; printf 'STEP_FAMILY=R17
+' > "$T/base/public/r/token/latest/one/report.txt"; "$T/base/bin/router-step-lineage" --marker STEP_FAMILY --value R17 | grep -Fqx 'LINEAGE_COUNT=1'
+echo RESULT=PASS_ROUTER_WORKFLOW_R17_SELFTEST

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE="/opt/router-ops/state/current-vm101-reference.env"
+
+[ -s "$STATE" ] || {
+  echo "VM101 reference state is not available"
+  exit 1
+}
+
+# shellcheck disable=SC1090
+. "$STATE"
+
+echo "VM101_REFERENCE_ID=$VM101_REFERENCE_ID"
+echo "VM101_REFERENCE=$VM101_REFERENCE"
+echo "VM101_REFERENCE_SNAPSHOT=$VM101_REFERENCE_SNAPSHOT"
+echo "VM101_REFERENCE_MANIFEST=$VM101_REFERENCE_MANIFEST"
+echo "VM101_PRIVATE_SNAPSHOT=$VM101_PRIVATE_SNAPSHOT"

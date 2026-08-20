@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+MODE=--publish
+if [[ "${1:-}" == --check ]]; then MODE=--check; shift; fi
+MACHINE="${1:-}"; shift || true
+DESCRIPTION="${*:-current managed source}"
+case "$MACHINE" in vm100|vm101|vm121|vm130) ;; *) echo 'Usage: router-machine-close [--check] {vm100|vm101|vm121|vm130} "description"' >&2; exit 2 ;; esac
+
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+PUBLIC_BASE="${ROUTER_PUBLIC_BASE_URL:-https://reports.secret-studio.ru}"; PUBLIC_BASE="${PUBLIC_BASE%/}"
+BACKEND="${ROUTER_MACHINE_CLOSE_BACKEND_OVERRIDE:-$BASE/bin/router-${MACHINE}-git-source-publish}"
+STATE_FILE="${ROUTER_MACHINE_CLOSE_STATE_FILE_OVERRIDE:-$BASE/state/current-${MACHINE}-git-source.env}"
+TOKEN_FILE="${ROUTER_PUBLIC_TOKEN_FILE:-$BASE/public/.router-public-token}"
+REINDEX="${ROUTER_MACHINE_CLOSE_REINDEX_OVERRIDE:-$BASE/bin/router-public-reindex}"
+CONTRACT_LIB="${ROUTER_MACHINE_CLOSE_CONTRACT_LIB_OVERRIDE:-$BASE/lib/router-machine-close-contract.sh}"
+RUN_ROOT="${ROUTER_MACHINE_CLOSE_RUN_ROOT_OVERRIDE:-$BASE/state/machine-close-runs}"
+TS="$(date -u +%Y%m%d-%H%M%S)"; RUN_DIR="$RUN_ROOT/${TS}_${MACHINE}_$$"; LOG="$RUN_DIR/backend.txt"
+mkdir -p "$RUN_DIR"; chmod 700 "$RUN_DIR"; printf '%s\n' "$DESCRIPTION" > "$RUN_DIR/description.txt"; chmod 600 "$RUN_DIR/description.txt"
+
+mc_stop() {
+    local result="$1" reason="$2" rc="${3:-1}"
+    echo "RESULT=$result"
+    echo "STOP_REASON=$reason"
+    echo "MACHINE=$MACHINE"
+    echo "MODE=$MODE"
+    echo "BACKEND_LOG=$LOG"
+    exit "$rc"
+}
+[[ -x "$BACKEND" ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_BACKEND_MISSING "$BACKEND" 70
+[[ -x "$REINDEX" ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_REINDEX_MISSING "$REINDEX" 70
+[[ -f "$TOKEN_FILE" ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_TOKEN_MISSING "$TOKEN_FILE" 70
+[[ -r "$CONTRACT_LIB" ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_CONTRACT_LIBRARY_MISSING "$CONTRACT_LIB" 70
+source "$CONTRACT_LIB"
+
+echo ">>> [router-machine-close] machine=$MACHINE mode=$MODE"
+set +e
+"$BACKEND" "$MODE" > "$LOG" 2>&1
+BACKEND_RC=$?
+set -e
+cat "$LOG"
+
+if ! router_machine_close_contract_classify "$MODE" "$MACHINE" "$BACKEND_RC" "$LOG"; then
+    rc="$BACKEND_RC"; [[ "$rc" -ne 0 ]] || rc=1
+    echo RESULT=STOP_ROUTER_MACHINE_CLOSE_BACKEND_OR_PUBLICATION
+    echo MACHINE="$MACHINE"
+    echo MODE="$MODE"
+    echo BACKEND_RC="$BACKEND_RC"
+    echo CLASSIFICATION="$ROUTER_MACHINE_CLOSE_CLASSIFICATION"
+    echo BACKEND_LOG="$LOG"
+    exit "$rc"
+fi
+
+if [[ "$MODE" == --check ]]; then
+    echo RESULT=PASS_ROUTER_MACHINE_CLOSE_CHECK
+    echo MACHINE="$MACHINE"
+    echo MODE=--check
+    echo DESCRIPTION="$DESCRIPTION"
+    echo BACKEND_RC="$BACKEND_RC"
+    echo BACKEND_RC_NONZERO_SALVAGED=$([[ "$BACKEND_RC" -ne 0 ]] && echo true || echo false)
+    echo CLASSIFICATION="$ROUTER_MACHINE_CLOSE_CLASSIFICATION"
+    echo BACKEND_LOG="$LOG"
+    exit 0
+fi
+
+[[ -f "$STATE_FILE" ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_STATE_FILE_MISSING "$STATE_FILE"
+MACHINE_UPPER="${MACHINE^^}"
+read_state() { local key="${MACHINE_UPPER}_GIT_SOURCE_$1"; awk -F= -v key="$key" '$1==key {print substr($0,index($0,"=")+1)}' "$STATE_FILE" | tail -n 1; }
+PUBLIC_URL="$(read_state URL)"; COMMIT="$(read_state COMMIT)"; TREE="$(read_state TREE)"; FILE_COUNT="$(read_state FILE_COUNT)"; PUBLIC_DIR="$(read_state PUBLIC_DIR)"
+TOKEN="$(cat "$TOKEN_FILE")"; EXPECTED_DIR_PREFIX="$BASE/public/r/$TOKEN/latest/"; EXPECTED_URL="$PUBLIC_BASE/latest/$(basename "$PUBLIC_DIR")/"
+[[ -n "$PUBLIC_URL" ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_STATE_URL_EMPTY state_url
+[[ "$COMMIT" =~ ^[0-9a-f]{40}$ ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_STATE_COMMIT_INVALID "$COMMIT"
+[[ "$TREE" =~ ^[0-9a-f]{40}$ ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_STATE_TREE_INVALID "$TREE"
+[[ "$FILE_COUNT" =~ ^[0-9]+$ ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_STATE_FILE_COUNT_INVALID "$FILE_COUNT"
+[[ -d "$PUBLIC_DIR" ]] || mc_stop STOP_ROUTER_MACHINE_CLOSE_STATE_PUBLIC_DIR_MISSING "$PUBLIC_DIR"
+case "$PUBLIC_DIR" in "$EXPECTED_DIR_PREFIX"*) ;; *) mc_stop STOP_INVALID_MACHINE_PUBLIC_DIR "$PUBLIC_DIR" ;; esac
+[[ "$PUBLIC_URL" == "$EXPECTED_URL" ]] || mc_stop STOP_INVALID_MACHINE_PUBLIC_URL "actual=$PUBLIC_URL expected=$EXPECTED_URL"
+grep -Fqx 'PERMANENT_HTTPS_PUBLISHED=true' "$LOG" || mc_stop STOP_PERMANENT_HTTPS_CONFIRMATION_MISSING backend_log
+grep -Fqx 'SOURCE_STATE_UPDATED=true' "$LOG" || mc_stop STOP_SOURCE_STATE_CONFIRMATION_MISSING backend_log
+grep -Fqx "${MACHINE_UPPER}_GIT_SOURCE_COMMIT=$COMMIT" "$LOG" || mc_stop STOP_STATE_COMMIT_NOT_IN_BACKEND_LOG "$COMMIT"
+grep -Fqx "${MACHINE_UPPER}_GIT_SOURCE_TREE=$TREE" "$LOG" || mc_stop STOP_STATE_TREE_NOT_IN_BACKEND_LOG "$TREE"
+if ! grep -Fqx "${MACHINE_UPPER}_PUBLIC_URL=$PUBLIC_URL" "$LOG" && ! grep -Fqx "${MACHINE_UPPER}_GIT_SOURCE_URL=$PUBLIC_URL" "$LOG"; then
+    mc_stop STOP_CANONICAL_MACHINE_URL_MISSING "$PUBLIC_URL"
+fi
+
+printf '%s\n' "$DESCRIPTION" > "$PUBLIC_DIR/step-description.txt"; chmod 644 "$PUBLIC_DIR/step-description.txt"
+INDEX_TMP="$PUBLIC_DIR/index.html.tmp.$$"
+{
+ echo '<!doctype html><html><head><meta charset="utf-8"><title>router report</title></head><body>'
+ printf '<h1>%s</h1>\n<ul>\n' "$(basename "$PUBLIC_DIR")"
+ find "$PUBLIC_DIR" -maxdepth 1 -type f ! -name index.html ! -name 'index.html.tmp.*' -printf '%f\n' | LC_ALL=C sort | while IFS= read -r name; do printf '<li><a href="%s">%s</a></li>\n' "$name" "$name"; done
+ echo '</ul><p><a href="../">Back to latest</a></p></body></html>'
+} > "$INDEX_TMP"
+chmod 644 "$INDEX_TMP"; mv -f "$INDEX_TMP" "$PUBLIC_DIR/index.html"; "$REINDEX" >/dev/null
+
+CURRENT="$BASE/state/current-machine-close-${MACHINE}.env"; CURRENT_TMP="${CURRENT}.tmp.$$"; mkdir -p "$(dirname "$CURRENT")"
+{
+ echo "ROUTER_MACHINE_CLOSE_UPDATED_AT_UTC=$TS"
+ echo ROUTER_MACHINE_CLOSE_RESULT=PASS
+ echo "ROUTER_MACHINE_CLOSE_MACHINE=$MACHINE"
+ echo "ROUTER_MACHINE_CLOSE_DESCRIPTION=$DESCRIPTION"
+ echo "ROUTER_MACHINE_CLOSE_COMMIT=$COMMIT"
+ echo "ROUTER_MACHINE_CLOSE_TREE=$TREE"
+ echo "ROUTER_MACHINE_CLOSE_FILE_COUNT=$FILE_COUNT"
+ echo "ROUTER_MACHINE_CLOSE_PUBLIC_URL=$PUBLIC_URL"
+ echo "ROUTER_MACHINE_CLOSE_PUBLIC_DIR=$PUBLIC_DIR"
+ echo "ROUTER_MACHINE_CLOSE_BACKEND_LOG=$LOG"
+ echo "ROUTER_MACHINE_CLOSE_BACKEND_RC=$BACKEND_RC"
+ echo "ROUTER_MACHINE_CLOSE_CLASSIFICATION=$ROUTER_MACHINE_CLOSE_CLASSIFICATION"
+} > "$CURRENT_TMP"
+chmod 600 "$CURRENT_TMP"; mv -f "$CURRENT_TMP" "$CURRENT"
+
+echo RESULT=PASS_ROUTER_MACHINE_CLOSE
+echo MACHINE="$MACHINE"
+echo DESCRIPTION="$DESCRIPTION"
+echo COMMIT="$COMMIT"
+echo TREE="$TREE"
+echo GIT_FILE_COUNT="$FILE_COUNT"
+echo SOURCE_PUBLISH_BACKEND="$BACKEND"
+echo BACKEND_LOG="$LOG"
+echo BACKEND_RC="$BACKEND_RC"
+echo BACKEND_RC_NONZERO_SALVAGED=$([[ "$BACKEND_RC" -ne 0 ]] && echo true || echo false)
+echo CLASSIFICATION="$ROUTER_MACHINE_CLOSE_CLASSIFICATION"
+echo "${MACHINE_UPPER}_PUBLIC_URL=$PUBLIC_URL"

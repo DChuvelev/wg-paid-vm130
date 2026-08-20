@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+import hashlib, json, re, sys
+from pathlib import Path
+root=Path(sys.argv[1] if len(sys.argv)>1 else '').resolve(); errors=[]
+def fail(code,detail): errors.append(f'{code}:{detail}')
+def text(path):
+    try: return path.read_text(encoding='utf-8')
+    except UnicodeDecodeError: return ''
+for rel in ('install.sh','manifest.sha256','release-info.json','tests/mandatory.list'):
+    if not (root/rel).is_file(): fail('missing_required',rel)
+if errors:
+    for e in errors: print(f'POLICY_ERROR={e}',file=sys.stderr)
+    print('RESULT=STOP_ROUTER_BUNDLE_POLICY_R19',file=sys.stderr); raise SystemExit(40)
+try: info=json.loads((root/'release-info.json').read_text(encoding='utf-8'))
+except Exception as exc: fail('release_info_invalid',str(exc)); info={}
+bytecode=[p.relative_to(root).as_posix() for p in root.rglob('*') if p.name=='__pycache__' or (p.is_file() and p.suffix in ('.pyc','.pyo'))]
+if bytecode: fail('python_bytecode_forbidden',','.join(bytecode[:20]))
+mandatory=[]
+for raw in (root/'tests/mandatory.list').read_text(encoding='utf-8').splitlines():
+    item=raw.strip()
+    if not item or item.startswith('#'): continue
+    if item in mandatory: fail('mandatory_duplicate',item)
+    mandatory.append(item)
+    if not (root/'tests'/item).is_file(): fail('mandatory_missing',item)
+if not mandatory: fail('mandatory_empty','tests/mandatory.list')
+diagp=root/'tests/diagnostic.list'
+if diagp.is_file():
+    diag={x.strip() for x in diagp.read_text(encoding='utf-8').splitlines() if x.strip() and not x.lstrip().startswith('#')}
+    overlap=sorted(diag.intersection(mandatory))
+    if overlap: fail('mandatory_diagnostic_overlap',','.join(overlap))
+if info.get('mandatory_fixture_count') is not None and info.get('mandatory_fixture_count')!=len(mandatory):
+    fail('mandatory_count_mismatch',f"{info.get('mandatory_fixture_count')}!={len(mandatory)}")
+declared=set(mandatory)
+if diagp.is_file(): declared.update(diag)
+if (root/'tests').is_dir():
+    unlisted=[]
+    for p in (root/'tests').iterdir():
+        if p.is_file() and p.name not in ('mandatory.list','diagnostic.list','target-syntax.list') and (p.suffix in ('.sh','.py') or p.stat().st_mode & 0o111) and p.name not in declared:
+            unlisted.append(p.name)
+    if unlisted: fail('test_not_declared',','.join(sorted(unlisted)))
+production=[root/'install.sh']
+for sub in ('scripts','rollback','payload/rootfs'):
+    base=root/sub
+    if base.exists(): production.extend(p for p in base.rglob('*') if p.is_file() and 'selftest' not in p.name and (p.suffix=='.sh' or p.name.startswith('router-') or p.name=='install.sh'))
+shell_files=[]
+for p in production:
+    t=text(p); first=t.splitlines()[0] if t.splitlines() else ''
+    if first.startswith('#!') and ('sh' in first or 'bash' in first): shell_files.append((p,t))
+unzip_re=re.compile(r'(^|[\s;&|])unzip([\s]|$)',re.M)
+busybox_re=re.compile(r'(^|[\s;&|])busybox([\s]|$)',re.M)
+for p,t in shell_files:
+    if unzip_re.search(t): fail('unzip_dependency',str(p.relative_to(root)))
+    if busybox_re.search(t): fail('local_busybox_dependency',str(p.relative_to(root)))
+remote_forbidden=[(re.compile(r'find[^\n]*(?:-printf|-quit)'),'busybox_find_gnu_option'),(re.compile(r'grep\s+-P'),'grep_pcre'),(re.compile(r'(^|[;\s])\[\[(?=\s)'),'bash_double_bracket'),(re.compile(r'\bmapfile\b'),'bash_mapfile'),(re.compile(r'<\('),'process_substitution')]
+for p,t in shell_files:
+    first=t.splitlines()[0] if t.splitlines() else ''
+    remote=(p.parent.name=='scripts' and first in ('#!/bin/sh','#!/bin/ash'))
+    if remote:
+        head='\n'.join(t.splitlines()[:12])
+        if not re.search(r'^# ROUTER_SCRIPT_TARGET=(VM100|VM101|PVE)$',head,re.M):
+            fail('remote_target_annotation_missing',str(p.relative_to(root)))
+        for rx,code in remote_forbidden:
+            if rx.search(t): fail(code,str(p.relative_to(root)))
+        if re.search(r'trap[^\n]*(?:EXIT|0)',t) and re.search(r'done\s*\|\s*sort',t):
+            fail('target_exit_trap_pipeline_subshell',str(p.relative_to(root)))
+for p,t in shell_files:
+    if '/root/.vm101-source.git' in t and 'ls-tree' in t:
+        if '--full-tree' not in t: fail('machine_git_missing_full_tree',str(p.relative_to(root)))
+        if 'git -C /' not in t and '--work-tree=/' not in t and '--work-tree /' not in t: fail('machine_git_missing_root_context',str(p.relative_to(root)))
+for p,t in shell_files:
+    for n,line in enumerate(t.splitlines(),1):
+        s=line.strip()
+        if not s or s.startswith('#'): continue
+        if 'vm101_run_command' in s and re.search(r'[|;`]|\$\(',s): fail('complex_nested_remote_command',f'{p.relative_to(root)}:{n}')
+        if re.search(r'router-machine-close(?!-safe)',s) and p.name!='router-machine-close-safe': fail('direct_machine_close_forbidden',f'{p.relative_to(root)}:{n}')
+installer=text(root/'install.sh')
+if re.search(r'^stop\s*\(\)\s*\{',installer,re.M):
+    count=len(re.findall(r'^stop\s*\(\)\s*\{',installer,re.M))
+    if count!=1: fail('stop_handler_count',str(count))
+    err=[x for x in installer.splitlines() if re.search(r'^\s*trap\s+.+\sERR\s*$',x) and 'trap - ERR' not in x]
+    if len(err)!=1: fail('err_trap_count',str(len(err)))
+    if int(info.get('workflow_contract_version') or 0)>=1 and 'STOP_COMMAND=' not in installer and 'router_step_emit_stop_evidence' not in installer:
+        fail('stop_exact_command_missing','install.sh')
+if info.get('classification')=='continuation':
+    if not info.get('previous_step'): fail('continuation_previous_step_missing','release-info.json')
+    if not info.get('first_unfinished_phase'): fail('continuation_first_unfinished_phase_missing','release-info.json')
+    for key in ('core_change_repeated','target_installer_rerun','target_postcheck_repeated','router_machine_close_rerun'):
+        if info.get(key) is True: fail('continuation_repeat_forbidden',key)
+packages=sorted((root/'payload').rglob('*target-package*.tar.gz')) if (root/'payload').exists() else []
+if packages:
+    if len(packages)!=1: fail('target_package_count',str(len(packages)))
+    else:
+        pkg=packages[0]; actual=hashlib.sha256(pkg.read_bytes()).hexdigest()
+        if info.get('target_package_sha256')!=actual: fail('target_package_release_sha_mismatch',actual)
+        ref=root/'reference/target-package.sha256'; expected=f'{actual}  {pkg.relative_to(root).as_posix()}'
+        if not ref.is_file(): fail('target_package_reference_missing',str(ref.relative_to(root)))
+        elif ref.read_text(encoding='utf-8').strip()!=expected: fail('target_package_reference_mismatch',str(ref.relative_to(root)))
+        applies=[p for p in (root/'scripts').glob('*apply*.sh')] if (root/'scripts').exists() else []
+        if not applies: fail('target_apply_script_missing','scripts/*apply*.sh')
+        elif not any('EXPECTED_PACKAGE_SHA="${1:?' in text(p) or re.search(r'EXPECTED_(?:PACKAGE|TARGET)_SHA=.*\$\{?1',text(p)) for p in applies): fail('target_apply_sha_not_argument',','.join(str(p.relative_to(root)) for p in applies))
+        if actual not in installer: fail('target_package_sha_missing_from_installer','install.sh')
+for p,t in shell_files:
+    if re.search(r'^rollback_now\s*\(\)',t,re.M):
+        if 'BACKUP_READY=false' not in t: fail('rollback_backup_ready_init_missing',str(p.relative_to(root)))
+        guarded=('[ "$BACKUP_READY" = true ] || return 0' in t or '[ "$BACKUP_READY" = "true" ] || return 0' in t or 'if [ "$BACKUP_READY" != true ]' in t or 'if [ "$BACKUP_READY" != "true" ]' in t)
+        if not guarded: fail('rollback_backup_ready_guard_missing',str(p.relative_to(root)))
+all_prod='\n'.join(t for _,t in shell_files)
+if 'hmn-rank-awg' in all_prod and ('provider-results-schema-adapter' not in all_prod and 'PROVIDER_RESULTS_SCHEMA_ADAPTER=true' not in all_prod and 'provider_results_schema_adapter' not in json.dumps(info,sort_keys=True)): fail('provider_schema_adapter_missing','hmn-rank-awg')
+for p,t in shell_files:
+    if 'STOP_ACTIVE_GENERATION_PATH_INVALID' in t and 'readlink -f' in t and 'GENERATION_STAGING_DIR' in t and not re.search(r'(STAGING_REAL|staging_real|router_path_is_within)',t): fail('logical_real_path_normalization_missing',str(p.relative_to(root)))
+if 'GENERATION_ACTIVATION_AUTH_DIR' in all_prod and 'ROUTER_EGRESS_ACTIVATION_AUTH_DIR' not in all_prod: fail('activation_auth_variable_contract','GENERATION_ACTIVATION_AUTH_DIR')
+if info.get('runtime_impact') is True and 'router-runtime-transition.sh' not in installer: fail('runtime_transition_library_required','install.sh')
+if int(info.get('workflow_contract_version') or 0)>=1:
+    matrix=root/str(info.get('target_environment_matrix',''))
+    ownership=root/str(info.get('path_ownership_manifest',''))
+    if not matrix.is_file():
+        fail('target_environment_matrix_missing',str(matrix))
+    else:
+        rows=[]
+        for n,line in enumerate(text(matrix).splitlines(),1):
+            if not line or line.lstrip().startswith('#'): continue
+            cols=line.split('\t'); rows.append(cols)
+            if len(cols)!=4 or cols[0] not in ('VM130','PVE','VM100','VM101') or cols[1] not in ('bash','posix-sh'):
+                fail('target_environment_matrix_invalid',f'{matrix.relative_to(root)}:{n}')
+        if sorted(r[0] for r in rows if len(r)==4)!=['PVE','VM100','VM101','VM130']:
+            fail('target_environment_matrix_incomplete',str(matrix.relative_to(root)))
+    if not ownership.is_file():
+        fail('path_ownership_manifest_missing',str(ownership))
+    else:
+        for n,line in enumerate(text(ownership).splitlines(),1):
+            if not line or line.lstrip().startswith('#'): continue
+            cols=line.split('\t')
+            if len(cols)!=4 or cols[0] not in ('VM130','PVE','VM100','VM101') or cols[1] not in ('durable','runtime','optional') or cols[2] not in ('true','false') or not cols[3].startswith('/'):
+                fail('path_ownership_manifest_invalid',f'{ownership.relative_to(root)}:{n}')
+            elif cols[1]=='optional' and cols[2]=='true':
+                fail('optional_path_mandatory',f'{ownership.relative_to(root)}:{n}')
+if int(info.get('workflow_contract_version') or 0)>=2:
+    if info.get('canonical_zip_required') is not True: fail('canonical_zip_required','release-info.json')
+    if info.get('exact_worker_fixture')!='tests/exact-worker.sh': fail('exact_worker_fixture_invalid',repr(info.get('exact_worker_fixture')))
+    if 'exact-worker.sh' not in mandatory: fail('exact_worker_fixture_not_mandatory','tests/mandatory.list')
+    for rel in ('install.sh',str(info.get('worker_entry') or '')):
+        if rel and re.search(r'^\s*TARGET_PACKAGE_SHA256\s*=\s*[\"\']?[0-9a-f]{64}',text(root/rel),re.M):
+            fail('target_sha_literal_forbidden',rel)
+if errors:
+    for e in errors: print(f'POLICY_ERROR={e}',file=sys.stderr)
+    print('RESULT=STOP_ROUTER_BUNDLE_POLICY_R19',file=sys.stderr); raise SystemExit(41)
+print('RESULT=PASS_ROUTER_BUNDLE_POLICY_R19'); print(f'MANDATORY_FIXTURE_COUNT={len(mandatory)}'); print('R19_SHARED_POLICY_APPLIED=true')

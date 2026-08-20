@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from collections import defaultdict
+
+PVE_KEY = "/root/.ssh/pve_to_openwrt_mgts_ed25519"
+
+def run(cmd, input_text=None, timeout=120):
+    p = subprocess.run(cmd, input=input_text, text=True, capture_output=True, timeout=timeout)
+    return {"rc": p.returncode, "stdout": p.stdout.strip(), "stderr": p.stderr.strip()}
+
+def vm121_psql_json(sql, timeout=120):
+    payload = base64.b64encode(sql.encode()).decode()
+    remote_py = r'''
+import base64, subprocess, sys, json
+sql = base64.b64decode(sys.argv[1]).decode()
+
+def run(cmd, input_text=None, timeout=120):
+    p = subprocess.run(cmd, input=input_text, text=True, capture_output=True, timeout=timeout)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+rc, out, err = run(["sh","-lc","docker ps --format '{{.Names}}' | grep -E '^wgaccess-postgres$|postgres' | head -1"], timeout=15)
+pg = out.strip()
+if not pg:
+    print(json.dumps({"error":"postgres container not found"}))
+    sys.exit(91)
+
+rc, out, err = run(
+    ["docker","exec","-i",pg,"sh","-lc",
+     'psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" -At'],
+    input_text=sql,
+    timeout=120,
+)
+if rc != 0:
+    print(json.dumps({"error": err}))
+    sys.exit(rc)
+print(out)
+'''
+    r = run(["ssh", "vm121", "python3", "-", payload], input_text=remote_py, timeout=timeout)
+    if r["rc"] != 0:
+        raise RuntimeError("VM121 psql failed: " + r["stderr"] + " " + r["stdout"])
+    out = r["stdout"]
+    return json.loads(out) if out else None
+
+def owrt(host, cmd, timeout=120):
+    inner = f"ssh -n -o StrictHostKeyChecking=no -i {shlex.quote(PVE_KEY)} root@{host} {shlex.quote(cmd)}"
+    r = run(["ssh", "pve-mgts", inner], timeout=timeout)
+    if r["rc"] != 0:
+        raise RuntimeError(f"OpenWrt {host} command failed: " + r["stderr"])
+    return r["stdout"]
+
+def parse_selector(text):
+    rows = []
+    in_sel = False
+    for line in text.splitlines():
+        if line.strip() == "__SELECTOR__":
+            in_sel = True
+            continue
+        if in_sel and line.startswith("__"):
+            break
+        if in_sel:
+            m = re.match(r"^(10\.253\.1\.\d+)\s+(cs[1-5])(?:\s+(.*))?$", line.strip())
+            if m:
+                rows.append({"tunnel_ip": m.group(1), "egress_class": m.group(2), "label": (m.group(3) or "").strip()})
+    return rows
+
+def parse_slot_map(text):
+    rows = []
+    for line in text.splitlines():
+        p = line.split("|")
+        if len(p) >= 5 and p[0].startswith("cs"):
+            rows.append({"egress_class": p[0], "table": p[1], "interface_name": p[2], "fwmark": p[3], "route": p[4]})
+    return rows
+
+def build_plan(db, selector_rows, slot_rows):
+    settings_rows = db["settings"]
+    targets_rows = db["targets"]
+    leases = db["leases"]
+    summary = db["summary"]
+
+    settings = {str(r.get("key")): r for r in settings_rows}
+    force_mode = settings.get("ROUTER_EGRESS_FORCE_MODE", {}).get("value_text") or "off"
+    rebalance_paused = settings.get("ROUTER_EGRESS_REBALANCE_PAUSED", {}).get("value_text") or "0"
+    allocator_enabled = settings.get("ROUTER_EGRESS_ALLOCATOR_ENABLED", {}).get("value_text") or "1"
+    cooldown_seconds = int(settings.get("ROUTER_EGRESS_REASSIGN_COOLDOWN_SECONDS", {}).get("value_int") or 900)
+    idle_seconds = int(settings.get("ROUTER_EGRESS_IDLE_SECONDS", {}).get("value_int") or 900)
+
+    enabled_targets = []
+    for t in targets_rows:
+        if str(t.get("status", "enabled")) == "enabled":
+            tid = str(t.get("id") or "")
+            if tid:
+                enabled_targets.append(tid)
+    enabled_targets = sorted(dict.fromkeys(enabled_targets))
+
+    load = defaultdict(list)
+    for l in leases:
+        load[str(l.get("target_id"))].append(l)
+
+    active = [l for l in leases if l.get("state") == "active"]
+    idle = [l for l in leases if l.get("state") == "idle"]
+    forced = [l for l in leases if l.get("forced") is True]
+
+    blocked_reasons = []
+    if allocator_enabled != "1":
+        blocked_reasons.append("allocator_disabled")
+    if force_mode != "off":
+        blocked_reasons.append("force_mode_not_off")
+    if rebalance_paused != "0":
+        blocked_reasons.append("rebalance_paused")
+    if forced:
+        blocked_reasons.append("forced_leases_present")
+    if summary.get("pending_jobs", 0) != 0:
+        blocked_reasons.append("pending_jobs_present")
+
+    selector_by_ip = {r["tunnel_ip"]: r for r in selector_rows}
+    slot_by_class = {r["egress_class"]: r for r in slot_rows}
+    target_by_id = {str(t.get("id")): t for t in targets_rows}
+
+    rows = []
+    for l in sorted(leases, key=lambda x: x.get("tunnel_ip", "")):
+        ip = l.get("tunnel_ip")
+        tid = l.get("target_id")
+        target = target_by_id.get(tid, {})
+        eclass = l.get("egress_class")
+        rows.append({
+            "tunnel_ip": ip,
+            "peer_id": l.get("peer_id"),
+            "state": l.get("state"),
+            "forced": l.get("forced"),
+            "current_target_id": tid,
+            "current_egress_class": eclass,
+            "target_status": target.get("status"),
+            "target_interface": target.get("interface_name"),
+            "selector_class": selector_by_ip.get(ip, {}).get("egress_class"),
+            "selector_matches_db_class": selector_by_ip.get(ip, {}).get("egress_class") == eclass,
+            "slot_seen": eclass in slot_by_class,
+            "last_activity_at": l.get("last_activity_at"),
+            "cooldown_until": l.get("cooldown_until"),
+        })
+
+    desired = {}
+    actions = []
+
+    if not blocked_reasons:
+        occupied = set()
+
+        # Preserve active/forced leases first.
+        for l in sorted(leases, key=lambda x: x.get("tunnel_ip", "")):
+            if l.get("state") == "active" or l.get("forced") is True:
+                desired[l.get("tunnel_ip")] = l.get("target_id")
+                occupied.add(l.get("target_id"))
+
+        available = [t for t in enabled_targets if t not in occupied]
+        idle_candidates = [l for l in sorted(leases, key=lambda x: x.get("tunnel_ip", "")) if l.get("state") != "active" and l.get("forced") is not True]
+
+        # Prefer stable assignment when unique and available.
+        for l in idle_candidates:
+            ip = l.get("tunnel_ip")
+            cur = l.get("target_id")
+            if cur in available:
+                desired[ip] = cur
+                available.remove(cur)
+
+        # Assign remaining idle leases to remaining targets.
+        for l in idle_candidates:
+            ip = l.get("tunnel_ip")
+            if ip in desired:
+                continue
+            cur = l.get("target_id")
+            new = available.pop(0) if available else cur
+            desired[ip] = new
+
+        for l in sorted(leases, key=lambda x: x.get("tunnel_ip", "")):
+            ip = l.get("tunnel_ip")
+            cur = l.get("target_id")
+            new = desired.get(ip, cur)
+            if new != cur:
+                new_target = target_by_id.get(new, {})
+                actions.append({
+                    "action": "reassign_idle_peer",
+                    "peer_id": l.get("peer_id"),
+                    "tunnel_ip": ip,
+                    "state": l.get("state"),
+                    "from_target_id": cur,
+                    "to_target_id": new,
+                    "from_egress_class": l.get("egress_class"),
+                    "to_egress_class": new_target.get("egress_class"),
+                    "reason": "balance_idle_peer_to_available_target",
+                    "would_write_db": True,
+                    "would_create_job": True,
+                    "would_touch_selector_via_agent": True,
+                })
+
+    plan = {
+        "schema": "wgpaid-egress-rebalancer-plan-v1",
+        "mode": "dry-run",
+        "timestamp": int(time.time()),
+        "policy": {
+            "version": "v1",
+            "allocator_enabled_required": True,
+            "never_move_active": True,
+            "never_move_forced": True,
+            "respect_force_mode": True,
+            "respect_rebalance_paused": True,
+            "respect_pending_jobs": True,
+            "idle_only_reassign": True,
+            "stable_assignment_preferred": True,
+            "cooldown_seconds": cooldown_seconds,
+            "idle_seconds": idle_seconds,
+        },
+        "settings": {
+            "allocator_enabled": allocator_enabled,
+            "force_mode": force_mode,
+            "rebalance_paused": rebalance_paused,
+        },
+        "db_summary": summary,
+        "targets": {
+            "enabled_target_ids": enabled_targets,
+            "enabled_target_count": len(enabled_targets),
+            "current_load": {tid: len(load.get(tid, [])) for tid in enabled_targets},
+        },
+        "leases": {
+            "rows": rows,
+            "active": [{"tunnel_ip": l.get("tunnel_ip"), "target_id": l.get("target_id")} for l in active],
+            "idle": [{"tunnel_ip": l.get("tunnel_ip"), "target_id": l.get("target_id")} for l in idle],
+            "forced": [{"tunnel_ip": l.get("tunnel_ip"), "target_id": l.get("target_id")} for l in forced],
+        },
+        "blocked_reasons": blocked_reasons,
+        "actions": actions,
+        "summary": {
+            "lease_rows": len(leases),
+            "target_count": len(enabled_targets),
+            "active_count": len(active),
+            "idle_count": len(idle),
+            "forced_count": len(forced),
+            "blocked": bool(blocked_reasons),
+            "action_count": len(actions),
+            "noop": (not blocked_reasons and len(actions) == 0),
+            "selector_match_count": sum(1 for r in rows if r["selector_matches_db_class"]),
+            "slot_seen_count": sum(1 for r in rows if r["slot_seen"]),
+        },
+    }
+    return plan
+
+def main():
+    ap = argparse.ArgumentParser(description="WG Paid egress rebalancer one-shot")
+    ap.add_argument("--apply", action="store_true", help="refused in STEP_045B; apply not implemented yet")
+    ap.add_argument("--json-out", default="-", help="write JSON plan")
+    args = ap.parse_args()
+
+    if args.apply:
+        print(json.dumps({
+            "schema": "wgpaid-egress-rebalancer-plan-v1",
+            "mode": "refused",
+            "error": "--apply is intentionally disabled in STEP_045B dry-run implementation",
+            "would_write": False,
+        }, ensure_ascii=False, indent=2))
+        sys.exit(78)
+
+    db = {
+        "summary": vm121_psql_json("""
+SELECT jsonb_build_object(
+  'enabled_peers', (SELECT count(*) FROM public.peers WHERE enabled=true),
+  'lease_rows', (SELECT count(*) FROM public.peer_egress_leases),
+  'active_leases', (SELECT count(*) FROM public.peer_egress_leases WHERE state='active'),
+  'idle_leases', (SELECT count(*) FROM public.peer_egress_leases WHERE state='idle'),
+  'forced_leases', (SELECT count(*) FROM public.peer_egress_leases WHERE forced=true),
+  'pending_jobs', (
+    SELECT count(*) FROM public.provisioning_jobs
+    WHERE lower(status::text) IN ('pending','queued','running','in_progress','processing','new')
+  )
+);
+"""),
+        "settings": vm121_psql_json("""
+SELECT COALESCE(jsonb_agg(to_jsonb(s) ORDER BY s.key), '[]'::jsonb)
+FROM public.egress_allocator_settings s;
+"""),
+        "targets": vm121_psql_json("""
+SELECT COALESCE(jsonb_agg(to_jsonb(t) ORDER BY t.id::text), '[]'::jsonb)
+FROM public.egress_targets t;
+"""),
+        "leases": vm121_psql_json("""
+WITH lease_rows AS (
+  SELECT
+    l.peer_id::text AS peer_id,
+    host(l.tunnel_ip)::text AS tunnel_ip,
+    l.tunnel_ip::text AS tunnel_cidr,
+    l.egress_class,
+    l.target_id,
+    l.state,
+    l.assignment_source,
+    l.forced,
+    l.last_rx_packets,
+    l.last_rx_bytes,
+    l.last_tx_packets,
+    l.last_tx_bytes,
+    l.last_activity_at,
+    l.updated_at,
+    l.reason,
+    l.cooldown_until,
+    p.enabled AS peer_enabled,
+    p.created_at AS peer_created_at
+  FROM public.peer_egress_leases l
+  JOIN public.peers p ON p.id = l.peer_id
+  WHERE p.enabled=true
+  ORDER BY l.tunnel_ip
+)
+SELECT COALESCE(jsonb_agg(to_jsonb(lease_rows)), '[]'::jsonb)
+FROM lease_rows;
+"""),
+    }
+
+    vm100 = owrt("10.71.100.1", """
+echo __WG_PAID__
+echo peer_count=$(wg show wg_paid peers 2>/dev/null | wc -l)
+echo allowed_ip_count=$(wg show wg_paid allowed-ips 2>/dev/null | grep -c '10.253.1.')
+echo uci_peer_sections=$(uci show network 2>/dev/null | grep -c '=wireguard_wg_paid' || true)
+echo __SELECTOR__
+if [ -f /etc/router-wgpay-selector.d/peers.conf ]; then
+  grep -Ev '^[[:space:]]*(#|$)' /etc/router-wgpay-selector.d/peers.conf || true
+else
+  echo NO_SELECTOR_FILE
+fi
+""")
+
+    vm101 = owrt("10.71.100.2", """
+for spec in "cs1 203 vpn3 0x203" "cs2 204 vpn4 0x204" "cs3 205 vpn5 0x205" "cs4 201 vpn1 0x201" "cs5 202 vpn2 0x202"; do
+  set -- $spec
+  cls="$1"; table="$2"; dev="$3"; mark="$4"
+  route="$(ip route show table "$table" 2>/dev/null | tr "\\n" ";")"
+  echo "$cls|table$table|$dev|$mark|$route"
+done
+""")
+
+    plan = build_plan(db, parse_selector(vm100), parse_slot_map(vm101))
+    plan["runtime"] = {
+        "vm100_peer_count_five": "peer_count=5" in vm100,
+        "vm100_allowed_ip_count_five": "allowed_ip_count=5" in vm100,
+        "vm100_uci_peer_sections_zero": "uci_peer_sections=0" in vm100,
+        "vm101_slot_rows": len(parse_slot_map(vm101)),
+    }
+
+    output = json.dumps(plan, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if args.json_out == "-":
+        print(output)
+    else:
+        Path(args.json_out).write_text(output, encoding="utf-8")
+
+if __name__ == "__main__":
+    main()

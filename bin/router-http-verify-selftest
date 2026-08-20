@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+TOOL="${ROUTER_HTTP_VERIFY_UNDER_TEST:-/opt/router-ops/bin/router-http-verify}"
+WORK="$(mktemp -d /tmp/router-http-verify-selftest.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+COUNTER="$WORK/counter"
+GOOD="$WORK/good"; printf 'fresh-content\n' > "$GOOD"; GOOD_SHA="$(sha256sum "$GOOD"|awk '{print $1}')"
+cat > "$WORK/fake-curl" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+out=''; write=''; url=''
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) out="$2"; shift 2 ;;
+    -w) write="$2"; shift 2 ;;
+    --resolve|--connect-timeout|--max-time) shift 2 ;;
+    --silent|--show-error|--location) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+n=0; [[ ! -f "$FAKE_COUNTER" ]] || n="$(cat "$FAKE_COUNTER")"; n=$((n+1)); echo "$n" > "$FAKE_COUNTER"
+if [[ "$n" -eq 1 ]]; then printf 'stale-content\n' > "$out"; else cp "$FAKE_GOOD" "$out"; fi
+printf '200'
+SH
+chmod 700 "$WORK/fake-curl"
+FAKE_COUNTER="$COUNTER" FAKE_GOOD="$GOOD" ROUTER_HTTP_CURL_BIN="$WORK/fake-curl" ROUTER_HTTP_HOST='' ROUTER_HTTP_RESOLVE_IP='' "$TOOL" --url https://example.invalid/file --output "$WORK/out" --sha256 "$GOOD_SHA" --retries 3 --delay 0 > "$WORK/pass.log" 2>&1
+grep -qx RESULT=PASS_ROUTER_HTTP_VERIFY "$WORK/pass.log"
+grep -qx HTTP_ATTEMPTS=2 "$WORK/pass.log"
+cmp -s "$WORK/out" "$GOOD"
+: > "$COUNTER"
+set +e
+FAKE_COUNTER="$COUNTER" FAKE_GOOD="$GOOD" ROUTER_HTTP_CURL_BIN="$WORK/fake-curl" ROUTER_HTTP_HOST='' ROUTER_HTTP_RESOLVE_IP='' "$TOOL" --url https://example.invalid/file --output "$WORK/fail" --sha256 "$(printf bad|sha256sum|awk '{print $1}')" --retries 2 --delay 0 > "$WORK/fail.log" 2>&1
+rc=$?
+set -e
+[[ "$rc" -ne 0 ]]
+grep -qx RESULT=STOP_ROUTER_HTTP_VERIFY "$WORK/fail.log"
+echo RESULT=PASS_ROUTER_HTTP_VERIFY_SELFTEST

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"; PUBLISHER="${ROUTER_PUBLISHER:-$BASE/bin/router-publish-report}"; HTTP="${ROUTER_HTTP_VERIFY:-$BASE/bin/router-http-verify}"; CONTRACT="${ROUTER_PUBLICATION_CONTRACT_LIB:-$BASE/lib/router-publication-contract.sh}"; WORKFLOW="${ROUTER_STEP_WORKFLOW_LIB:-$BASE/lib/router-step-workflow.sh}"
+LABEL=''; PAYLOAD=''; CURRENT=''; EVENTS=''; OUT=''; EXPECT_KIND='step-report'
+while (($#)); do case "$1" in --label) LABEL="$2"; shift 2;; --payload-dir) PAYLOAD="$2"; shift 2;; --workflow-current) CURRENT="$2"; shift 2;; --workflow-events) EVENTS="$2"; shift 2;; --output-env) OUT="$2"; shift 2;; --expect-kind) EXPECT_KIND="$2"; shift 2;; *) echo RESULT=STOP_ROUTER_STEP_FINALIZE_USAGE; exit 2;; esac; done
+[[ -n "$LABEL" && -d "$PAYLOAD" && -n "$CURRENT" && -n "$EVENTS" && -n "$OUT" ]] || { echo RESULT=STOP_ROUTER_STEP_FINALIZE_USAGE; exit 2; }
+source "$CONTRACT"; source "$WORKFLOW"; router_step_workflow_attach "$CURRENT" "$EVENTS"
+mapfile -t FILES < <(find "$PAYLOAD" -maxdepth 1 -type f -print | LC_ALL=C sort); ((${#FILES[@]}>0))
+PREF="${OUT}.preflight"; "$PUBLISHER" --preflight "$LABEL" "${FILES[@]}" > "$PREF"; grep -Fqx "PUBLIC_OBJECT_KIND=$EXPECT_KIND" "$PREF"
+LOG="${OUT}.publish"; "$PUBLISHER" "$LABEL" "${FILES[@]}" > "$LOG"; router_publication_contract_load "$LOG" "$EXPECT_KIND"
+router_step_publication_barrier_mark_committed "$RPC_PUBLIC_URL"
+INDEX_OUT="${OUT}.index.html"; "$HTTP" --url "$RPC_PUBLIC_URL" --output "$INDEX_OUT" >> "${OUT}.http" 2>&1
+for name in facts-public.html verify-public.html rollback-public.html; do if [[ -f "$RPC_PUBLISHED_DIR/$name" ]]; then "$HTTP" --url "${RPC_PUBLIC_URL}${name}" --output "${OUT}.${name}" --sha256 "$(sha256sum "$RPC_PUBLISHED_DIR/$name"|awk '{print $1}')" >> "${OUT}.http" 2>&1; fi; done
+router_step_publication_barrier_mark_verified "$RPC_PUBLIC_URL"
+# Complete any optional finalization phases before marking workflow complete is the caller's responsibility.
+tmp="${OUT}.tmp.$$"; { echo RESULT=PASS_ROUTER_STEP_FINALIZE; echo "PUBLIC_URL=$RPC_PUBLIC_URL"; echo "PUBLISHED_DIR=$RPC_PUBLISHED_DIR"; echo "PUBLIC_OBJECT_KIND=$RPC_PUBLIC_OBJECT_KIND"; echo HTTP_VERIFY_PASS=true; echo PUBLICATION_BARRIER=verified; } > "$tmp"; chmod 600 "$tmp"; mv -f "$tmp" "$OUT"
+cat "$OUT"

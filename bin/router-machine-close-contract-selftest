@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+WRAPPER="${ROUTER_MACHINE_CLOSE_WRAPPER_UNDER_TEST:-/opt/router-ops/bin/router-machine-close}"
+LIBRARY="${ROUTER_MACHINE_CLOSE_LIBRARY_UNDER_TEST:-/opt/router-ops/lib/router-machine-close-contract.sh}"
+WORK="$(mktemp -d /tmp/router-machine-close-contract-selftest.XXXXXX)"; trap 'rm -rf "$WORK"' EXIT
+BASE="$WORK/base"; TOKEN=synthetic-token; PUBLIC_BASE=https://reports.secret-studio.ru
+STATE_FILE="$BASE/state/current-vm101-git-source.env"; TOKEN_FILE="$BASE/public/.router-public-token"; REINDEX="$WORK/reindex"; RUN_ROOT="$WORK/runs"
+mkdir -p "$BASE/bin" "$BASE/lib" "$BASE/state" "$BASE/public/r/$TOKEN/latest" "$RUN_ROOT"; printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
+cat > "$REINDEX" <<'SH'
+#!/usr/bin/env bash
+exit 0
+SH
+chmod 700 "$REINDEX"
+write_pass_evidence(){ local folder="$1" omit="${2:-none}"; local dir="$BASE/public/r/$TOKEN/latest/$folder" url="$PUBLIC_BASE/latest/$folder/"; mkdir -p "$dir"; cat > "$STATE_FILE" <<STATE
+VM101_GIT_SOURCE_COMMIT=1111111111111111111111111111111111111111
+VM101_GIT_SOURCE_TREE=2222222222222222222222222222222222222222
+VM101_GIT_SOURCE_FILE_COUNT=33
+VM101_GIT_SOURCE_PUBLIC_DIR=$dir
+VM101_GIT_SOURCE_URL=$url
+STATE
+cat <<OUT
+RESULT=PASS_vm101_GIT_PUBLISH
+VM130_STATUS=CLEAN
+PUBLISHER_RESULT=PASS_ROUTER_PUBLISH_REPORT
+PUBLICATION_COMMITTED=true
+LOCAL_POSTCHECK=PASS
+LATEST_INDEX_CONTAINS_FOLDER=true
+HTTP_POSTCHECK=PASS
+PERMANENT_HTTPS_PUBLISHED=true
+SOURCE_STATE_UPDATED=true
+VM101_PUBLIC_URL=$url
+VM101_GIT_SOURCE_COMMIT=1111111111111111111111111111111111111111
+VM101_GIT_SOURCE_TREE=2222222222222222222222222222222222222222
+VM101_GIT_SOURCE_FILE_COUNT=33
+VM101_GIT_SOURCE_URL=$url
+OUT
+}
+make_backend(){ local name="$1" mode="$2" rc="$3"; cat > "$WORK/$name" <<BACKEND
+#!/usr/bin/env bash
+set -u
+BASE="\${ROUTER_OPS_BASE:?}"; PUBLIC_BASE="\${ROUTER_PUBLIC_BASE_URL:?}"; TOKEN="\$(cat "\${ROUTER_PUBLIC_TOKEN_FILE:?}")"; STATE_FILE="\${ROUTER_MACHINE_CLOSE_STATE_FILE_OVERRIDE:?}"
+$(declare -f write_pass_evidence)
+case "$mode" in
+ pass) write_pass_evidence 20260717-000000_vm101_git_source_deadbeef ;;
+ incomplete) write_pass_evidence 20260717-000000_vm101_git_source_deadbeef | grep -v '^SOURCE_STATE_UPDATED=' ;;
+ backend_stop) echo RESULT=STOP_SYNTHETIC_BACKEND ;;
+ timeout) echo SYNTHETIC_TIMEOUT=true ;;
+ check) echo RESULT=PASS_VM130_VM101_GIT_SOURCE_CHECK ;;
+esac
+exit $rc
+BACKEND
+chmod 700 "$WORK/$name"; }
+make_backend pass0 pass 0; make_backend pass1 pass 1; make_backend incomplete incomplete 0; make_backend backend_stop backend_stop 1; make_backend timeout timeout 124; make_backend check check 0
+run_case(){ local name="$1" expected="$2" mode="${3:---publish}" log rc; log="$WORK/$name.log"; rm -f "$STATE_FILE"; rm -rf "$BASE/public/r/$TOKEN/latest"/*; set +e; ( export ROUTER_OPS_BASE="$BASE" ROUTER_PUBLIC_BASE_URL="$PUBLIC_BASE" ROUTER_PUBLIC_TOKEN_FILE="$TOKEN_FILE" ROUTER_MACHINE_CLOSE_BACKEND_OVERRIDE="$WORK/$name" ROUTER_MACHINE_CLOSE_STATE_FILE_OVERRIDE="$STATE_FILE" ROUTER_MACHINE_CLOSE_REINDEX_OVERRIDE="$REINDEX" ROUTER_MACHINE_CLOSE_CONTRACT_LIB_OVERRIDE="$LIBRARY" ROUTER_MACHINE_CLOSE_RUN_ROOT_OVERRIDE="$RUN_ROOT"; if [[ "$mode" == --check ]]; then "$WRAPPER" --check vm101 "SYNTHETIC $name"; else "$WRAPPER" vm101 "SYNTHETIC $name"; fi ) > "$log" 2>&1; rc=$?; set -e; if [[ "$expected" == pass ]]; then [[ "$rc" -eq 0 ]]; grep -Eq '^RESULT=PASS_ROUTER_MACHINE_CLOSE(_CHECK)?$' "$log"; ! grep -Eq '^RESULT=STOP_|^STOP=' "$log"; else [[ "$rc" -ne 0 ]]; grep -Eq '^RESULT=STOP_ROUTER_MACHINE_CLOSE' "$log"; fi; echo "CASE=$name EXPECTED=$expected RC=$rc PASS=true"; }
+run_case pass0 pass; run_case pass1 pass; run_case incomplete stop; run_case backend_stop stop; run_case timeout stop; run_case check pass --check
+grep -qx BACKEND_RC_NONZERO_SALVAGED=true "$WORK/pass1.log"
+grep -qx CLASSIFICATION=PASS_AUTHORITATIVE_EVIDENCE_DESPITE_BACKEND_RC "$WORK/pass1.log"
+echo RESULT=PASS_ROUTER_MACHINE_CLOSE_CONTRACT_SELFTEST

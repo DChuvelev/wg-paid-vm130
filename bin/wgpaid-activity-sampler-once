@@ -1,0 +1,373 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PVE_KEY = "/root/.ssh/pve_to_openwrt_mgts_ed25519"
+VM100_IP = "10.71.100.1"
+VM121_ALIAS = "vm121"
+
+def run(cmd, input_text=None, timeout=120):
+    p = subprocess.run(cmd, input=input_text, text=True, capture_output=True, timeout=timeout)
+    return {
+        "rc": p.returncode,
+        "stdout": p.stdout.strip(),
+        "stderr": p.stderr.strip(),
+        "cmd": " ".join(cmd[:5]) + (" ..." if len(cmd) > 5 else ""),
+    }
+
+def owrt(cmd, timeout=120):
+    inner = f"ssh -n -o StrictHostKeyChecking=no -i {shlex.quote(PVE_KEY)} root@{shlex.quote(VM100_IP)} {shlex.quote(cmd)}"
+    r = run(["ssh", "pve-mgts", inner], timeout=timeout)
+    if r["rc"] != 0:
+        raise RuntimeError("OpenWrt command failed: " + r["stderr"])
+    return r["stdout"]
+
+def vm121_psql(sql, timeout=120):
+    payload = base64.b64encode(sql.encode()).decode()
+    remote_py = r'''
+import base64, subprocess, sys
+sql = base64.b64decode(sys.argv[1]).decode()
+
+def run(cmd, input_text=None, timeout=120):
+    p = subprocess.run(cmd, input=input_text, text=True, capture_output=True, timeout=timeout)
+    return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+rc, out, err = run(["sh","-lc","docker ps --format '{{.Names}}' | grep -E '^wgaccess-postgres$|postgres' | head -1"], timeout=15)
+pg = out.strip()
+if not pg:
+    print("ERROR: postgres container not found", file=sys.stderr)
+    sys.exit(91)
+
+rc, out, err = run(
+    ["docker","exec","-i",pg,"sh","-lc",
+     'psql -v ON_ERROR_STOP=1 -U "${POSTGRES_USER:-postgres}" -d "${POSTGRES_DB:-postgres}" -AtF "|"'],
+    input_text=sql,
+    timeout=120,
+)
+if rc != 0:
+    print(err, file=sys.stderr)
+    sys.exit(rc)
+print(out)
+'''
+    r = run(["ssh", VM121_ALIAS, "python3", "-", payload], input_text=remote_py, timeout=timeout)
+    if r["rc"] != 0:
+        raise RuntimeError("VM121 psql failed: " + r["stderr"])
+    return r["stdout"]
+
+def section(text, name):
+    pat = r"__" + re.escape(name) + r"__\n(.*?)(?=\n__[A-Z0-9_]+__|\Z)"
+    m = re.search(pat, text, re.S)
+    return m.group(1).strip() if m else ""
+
+def parse_counters(text):
+    counters_text = section(text, "NFT_COUNTERS")
+    rows = {}
+    pattern = re.compile(
+        r"counter\s+(peer_10_253_1_(\d+)_(out|in)_vpn)\s*\{[^}]*?packets\s+(\d+)\s+bytes\s+(\d+)",
+        re.S,
+    )
+    for m in pattern.finditer(counters_text):
+        rows[m.group(1)] = {
+            "counter_name": m.group(1),
+            "tunnel_ip": f"10.253.1.{m.group(2)}",
+            "direction": m.group(3) + "_vpn",
+            "packets": int(m.group(4)),
+            "bytes": int(m.group(5)),
+        }
+    return rows
+
+def parse_selector(text):
+    rows = []
+    in_sel = False
+    for line in text.splitlines():
+        if line.strip() == "__SELECTOR__":
+            in_sel = True
+            continue
+        if in_sel and line.startswith("__"):
+            break
+        if in_sel:
+            m = re.match(r"^(10\.253\.1\.\d+)\s+(cs[1-5])(?:\s+(.*))?$", line.strip())
+            if m:
+                rows.append({"tunnel_ip": m.group(1), "egress_class": m.group(2), "label": (m.group(3) or "").strip()})
+    return rows
+
+def parse_settings(text):
+    rows = {}
+    for line in text.splitlines():
+        parts = line.split("|")
+        if len(parts) >= 4:
+            rows[parts[0]] = {"value_text": parts[1], "value_int": parts[2], "description": parts[3]}
+    return rows
+
+def parse_leases(text):
+    rows = []
+    for line in text.splitlines():
+        parts = line.split("|")
+        if len(parts) >= 13:
+            rows.append({
+                "peer_id": parts[0],
+                "tunnel_ip": parts[1],
+                "egress_class": parts[2],
+                "target_id": parts[3],
+                "state": parts[4],
+                "forced": parts[5] == "true",
+                "last_rx_packets": int(parts[6] or 0),
+                "last_rx_bytes": int(parts[7] or 0),
+                "last_tx_packets": int(parts[8] or 0),
+                "last_tx_bytes": int(parts[9] or 0),
+                "last_activity_at": parts[10],
+                "reason": parts[11],
+                "updated_at": parts[12],
+            })
+    return rows
+
+def parse_summary(text):
+    d = {}
+    for line in text.splitlines():
+        parts = line.split("|")
+        if len(parts) == 2 and parts[1].isdigit():
+            d[parts[0]] = int(parts[1])
+    return d
+
+def sql_quote(s):
+    if s is None or s == "":
+        return "NULL"
+    return "'" + str(s).replace("'", "''") + "'"
+
+def sql_uuid(s):
+    return sql_quote(s) + "::uuid"
+
+def sql_inet(s):
+    return sql_quote(s + "/32") + "::inet"
+
+def sql_text(s):
+    return sql_quote(s) + "::text"
+
+def build_update_sql(rows):
+    values = []
+    for r in rows:
+        values.append("(" + ",".join([
+            sql_uuid(r["peer_id"]),
+            sql_inet(r["tunnel_ip"]),
+            str(r["current_counters"]["tx_packets"]) + "::bigint",
+            str(r["current_counters"]["tx_bytes"]) + "::bigint",
+            str(r["current_counters"]["rx_packets"]) + "::bigint",
+            str(r["current_counters"]["rx_bytes"]) + "::bigint",
+            "true" if r["active_eval"]["active_now"] else "false",
+            "true" if r["active_eval"]["set_last_activity_at_now"] else "false",
+            sql_text(r["active_eval"]["new_state"]),
+            sql_text(r["active_eval"]["reason"]),
+        ]) + ")")
+    values_sql = ",\n".join(values)
+    return f"""BEGIN;
+WITH v(peer_id,tunnel_ip,last_tx_packets,last_tx_bytes,last_rx_packets,last_rx_bytes,active_now,set_last_activity_at,new_state,reason) AS (
+VALUES
+{values_sql}
+),
+updated AS (
+  UPDATE public.peer_egress_leases AS l
+  SET
+    last_tx_packets = v.last_tx_packets,
+    last_tx_bytes = v.last_tx_bytes,
+    last_rx_packets = v.last_rx_packets,
+    last_rx_bytes = v.last_rx_bytes,
+    state = v.new_state,
+    last_activity_at = CASE WHEN v.set_last_activity_at THEN now() ELSE l.last_activity_at END,
+    updated_at = now(),
+    reason = v.reason
+  FROM v
+  WHERE l.peer_id = v.peer_id
+    AND l.tunnel_ip = v.tunnel_ip
+  RETURNING l.peer_id
+)
+SELECT 'sampler_update_rows', count(*)::text FROM updated;
+COMMIT;
+"""
+
+def main():
+    ap = argparse.ArgumentParser(description="WG Paid one-shot activity sampler")
+    ap.add_argument("--apply", action="store_true", help="write sampler baselines/state to DB")
+    ap.add_argument("--json-out", default="-", help="write JSON result")
+    args = ap.parse_args()
+
+    counters_raw = owrt("""
+echo "__WG_PAID__"
+echo listen_port=$(wg show wg_paid listen-port 2>/dev/null || true)
+echo peer_count=$(wg show wg_paid peers 2>/dev/null | wc -l)
+echo allowed_ip_count=$(wg show wg_paid allowed-ips 2>/dev/null | grep -c "10.253.1.")
+echo "__SELECTOR__"
+if [ -f /etc/router-wgpay-selector.d/peers.conf ]; then
+  grep -Ev "^[[:space:]]*(#|$)" /etc/router-wgpay-selector.d/peers.conf || true
+else
+  echo "NO_SELECTOR_FILE"
+fi
+echo "__ACTIVITY_SERVICE__"
+/etc/init.d/router-egress-activity enabled >/dev/null 2>&1; echo activity_enabled_rc=$?
+/etc/init.d/router-egress-activity status >/dev/null 2>&1; echo activity_status_rc=$?
+echo "__NFT_COUNTERS__"
+nft list counters table inet router_egress_activity 2>/dev/null || true
+""")
+
+    summary_sql = """
+SELECT 'enabled_peers', count(*)::text FROM public.peers WHERE enabled=true
+UNION ALL SELECT 'lease_rows', count(*)::text FROM public.peer_egress_leases
+UNION ALL SELECT 'idle_leases', count(*)::text FROM public.peer_egress_leases WHERE state='idle'
+UNION ALL SELECT 'active_leases', count(*)::text FROM public.peer_egress_leases WHERE state='active'
+UNION ALL SELECT 'forced_leases', count(*)::text FROM public.peer_egress_leases WHERE forced=true
+UNION ALL SELECT 'pending_jobs', count(*)::text FROM public.provisioning_jobs
+WHERE lower(status::text) IN ('pending','queued','running','in_progress','processing','new');
+"""
+    leases_sql = """
+SELECT
+  l.peer_id::text,
+  host(l.tunnel_ip)::text,
+  l.egress_class,
+  COALESCE(l.target_id,''),
+  l.state,
+  l.forced::text,
+  l.last_rx_packets::text,
+  l.last_rx_bytes::text,
+  l.last_tx_packets::text,
+  l.last_tx_bytes::text,
+  COALESCE(l.last_activity_at::text,''),
+  l.reason,
+  COALESCE(l.updated_at::text,'')
+FROM public.peer_egress_leases l
+JOIN public.peers p ON p.id = l.peer_id
+WHERE p.enabled=true
+ORDER BY l.tunnel_ip;
+"""
+    settings_sql = """
+SELECT key, value_text, COALESCE(value_int::text, ''), description
+FROM public.egress_allocator_settings
+ORDER BY key;
+"""
+
+    db_summary_pre = parse_summary(vm121_psql(summary_sql))
+    leases = parse_leases(vm121_psql(leases_sql))
+    settings = parse_settings(vm121_psql(settings_sql))
+
+    counters = parse_counters(counters_raw)
+    selector = parse_selector(counters_raw)
+    selector_by_ip = {r["tunnel_ip"]: r for r in selector}
+
+    packets_min = int(settings.get("ROUTER_EGRESS_ACTIVE_MIN_PACKETS", {}).get("value_int") or 10)
+    bytes_min = int(settings.get("ROUTER_EGRESS_ACTIVE_MIN_BYTES", {}).get("value_int") or 16384)
+    idle_seconds = int(settings.get("ROUTER_EGRESS_IDLE_SECONDS", {}).get("value_int") or 900)
+    sample_seconds = int(settings.get("ROUTER_EGRESS_SAMPLE_SECONDS", {}).get("value_int") or 120)
+    force_mode = settings.get("ROUTER_EGRESS_FORCE_MODE", {}).get("value_text") or "off"
+    rebalance_paused = settings.get("ROUTER_EGRESS_REBALANCE_PAUSED", {}).get("value_text") or "0"
+
+    rows = []
+    for lease in leases:
+        ip = lease["tunnel_ip"]
+        ip_s = ip.replace(".", "_")
+        out_name = f"peer_{ip_s}_out_vpn"
+        in_name = f"peer_{ip_s}_in_vpn"
+
+        out_c = counters.get(out_name, {"packets": 0, "bytes": 0})
+        in_c = counters.get(in_name, {"packets": 0, "bytes": 0})
+
+        delta_tx_packets = max(0, out_c["packets"] - lease["last_tx_packets"])
+        delta_tx_bytes = max(0, out_c["bytes"] - lease["last_tx_bytes"])
+        delta_rx_packets = max(0, in_c["packets"] - lease["last_rx_packets"])
+        delta_rx_bytes = max(0, in_c["bytes"] - lease["last_rx_bytes"])
+        delta_packets = delta_tx_packets + delta_rx_packets
+        delta_bytes = delta_tx_bytes + delta_rx_bytes
+
+        active_now = delta_packets >= packets_min or delta_bytes >= bytes_min
+
+        if active_now:
+            new_state = "active"
+            reason = "activity_sampler_active"
+            set_last_activity = True
+        elif lease["state"] == "active":
+            new_state = "active"
+            reason = "activity_sampler_keep_active_no_delta"
+            set_last_activity = False
+        else:
+            new_state = "idle"
+            reason = "activity_sampler_idle_no_delta"
+            set_last_activity = False
+
+        rows.append({
+            **lease,
+            "selector_class": selector_by_ip.get(ip, {}).get("egress_class", ""),
+            "counter_names": {"out": out_name, "in": in_name},
+            "current_counters": {
+                "tx_packets": out_c["packets"],
+                "tx_bytes": out_c["bytes"],
+                "rx_packets": in_c["packets"],
+                "rx_bytes": in_c["bytes"],
+            },
+            "delta": {
+                "tx_packets": delta_tx_packets,
+                "tx_bytes": delta_tx_bytes,
+                "rx_packets": delta_rx_packets,
+                "rx_bytes": delta_rx_bytes,
+                "total_packets": delta_packets,
+                "total_bytes": delta_bytes,
+            },
+            "active_eval": {
+                "active_now": active_now,
+                "new_state": new_state,
+                "reason": reason,
+                "set_last_activity_at_now": set_last_activity,
+                "packets_min": packets_min,
+                "bytes_min": bytes_min,
+            },
+        })
+
+    result = {
+        "schema": "wgpaid-activity-sampler-result-v1",
+        "mode": "apply" if args.apply else "dry-run",
+        "timestamp": int(time.time()),
+        "db_summary_pre": db_summary_pre,
+        "settings": {
+            "packets_min": packets_min,
+            "bytes_min": bytes_min,
+            "sample_seconds": sample_seconds,
+            "idle_seconds": idle_seconds,
+            "force_mode": force_mode,
+            "rebalance_paused": rebalance_paused,
+        },
+        "vm100": {
+            "peer_count_five": "peer_count=5" in counters_raw,
+            "allowed_ip_count_five": "allowed_ip_count=5" in counters_raw,
+            "activity_service_enabled": "activity_enabled_rc=0" in counters_raw,
+            "activity_service_status_ok": "activity_status_rc=0" in counters_raw,
+            "counter_rows": len(counters),
+            "selector_rows": len(selector),
+        },
+        "rows": rows,
+        "summary": {
+            "rows": len(rows),
+            "active_by_new_delta_count": sum(1 for r in rows if r["active_eval"]["active_now"]),
+            "rows_with_zero_delta": sum(1 for r in rows if r["delta"]["total_packets"] == 0 and r["delta"]["total_bytes"] == 0),
+            "rows_with_selector_match": sum(1 for r in rows if r["egress_class"] == r["selector_class"]),
+        },
+        "apply": {"attempted": bool(args.apply), "executed": False, "result": None},
+    }
+
+    if args.apply:
+        sql = build_update_sql(rows)
+        result["apply"]["result"] = vm121_psql(sql, timeout=120)
+        result["apply"]["executed"] = True
+        result["db_summary_post"] = parse_summary(vm121_psql(summary_sql))
+
+    output = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if args.json_out == "-":
+        print(output)
+    else:
+        Path(args.json_out).write_text(output, encoding="utf-8")
+
+if __name__ == "__main__":
+    main()

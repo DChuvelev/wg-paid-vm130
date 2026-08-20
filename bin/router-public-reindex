@@ -1,0 +1,75 @@
+#!/bin/sh
+set -eu
+
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+PUBLIC="$BASE/public"
+TOKEN_FILE="${ROUTER_PUBLIC_TOKEN_FILE:-$PUBLIC/.router-public-token}"
+TOKEN="${ROUTER_PUBLIC_TOKEN:-}"
+
+if [ -z "$TOKEN" ]; then
+  TOKEN="$(cat "$TOKEN_FILE")"
+fi
+
+ROOT="${ROUTER_PUBLIC_ROOT:-$PUBLIC/r/$TOKEN}"
+LATEST="$ROOT/latest"
+OLD="$ROOT/old"
+
+mkdir -p "$LATEST" "$OLD"
+chmod 755 "$ROOT" "$LATEST" "$OLD"
+
+html_index() {
+  DIR="$1"
+  TITLE="$2"
+  PARENT="$3"
+  TMP="$DIR/index.html.tmp.$$"
+
+  {
+    echo '<!doctype html><html><head><meta charset="utf-8">'
+    printf '<title>%s</title></head><body>\n' "$TITLE"
+    printf '<h1>%s</h1>\n<ul>\n' "$TITLE"
+
+    find "$DIR" \
+      -mindepth 1 \
+      -maxdepth 1 \
+      ! -name index.html \
+      ! -name 'index.html.tmp.*' \
+      -printf '%f\n' |
+    LC_ALL=C sort -r |
+    while IFS= read -r NAME; do
+      [ -n "$NAME" ] || continue
+      if [ -d "$DIR/$NAME" ]; then
+        printf '<li><a href="%s/">%s/</a></li>\n' "$NAME" "$NAME"
+      else
+        printf '<li><a href="%s">%s</a></li>\n' "$NAME" "$NAME"
+      fi
+    done
+
+    echo '</ul>'
+    printf '<p><a href="%s">Back</a></p>\n' "$PARENT"
+    echo '</body></html>'
+  } > "$TMP"
+
+  chmod 644 "$TMP"
+  mv -f "$TMP" "$DIR/index.html"
+}
+
+html_index "$LATEST" 'WG Paid / MGTS — latest' '../'
+html_index "$OLD" 'WG Paid / MGTS — old' '../'
+
+ROOT_TMP="$ROOT/index.html.tmp.$$"
+{
+  echo '<!doctype html><html><head><meta charset="utf-8"><title>WG Paid / MGTS publications</title></head><body>'
+  echo '<h1>WG Paid / MGTS publications</h1>'
+  echo '<ul>'
+  echo '<li><a href="latest/">latest/ — current confirmed project artifacts</a></li>'
+  echo '<li><a href="old/">old/ — historical publications</a></li>'
+  echo '</ul>'
+  echo '</body></html>'
+} > "$ROOT_TMP"
+
+chmod 644 "$ROOT_TMP"
+mv -f "$ROOT_TMP" "$ROOT/index.html"
+
+echo "INDEX=$ROOT/index.html"
+echo "LATEST_INDEX=$LATEST/index.html"
+echo "OLD_INDEX=$OLD/index.html"

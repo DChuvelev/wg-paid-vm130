@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+POLICY="$BASE/bin/router-bundle-policy-r20"
+CONTRACT="$BASE/lib/router-r20-degraded-contract.sh"
+OUT="${1:-$(mktemp -d)}"
+rm -rf "$OUT"; mkdir -p "$OUT"
+source "$CONTRACT"
+r20_mode_valid NORMAL
+r20_mode_valid DEGRADED_POOL
+! r20_mode_valid DIRECT_EMERGENCY
+! r20_retry_due 99 100
+r20_retry_due 100 100
+r20_snapshot_name_valid R20C_PRE_20260719
+make_base(){
+  local d
+  d="$1"
+  mkdir -p "$d/tests"
+  printf '#!/usr/bin/env bash\nset -Eeuo pipefail\necho ok\n' >"$d/install.sh"
+  chmod 700 "$d/install.sh"
+  printf '{}\n' >"$d/release-info.json"
+  : >"$d/tests/mandatory.list"
+}
+make_base "$OUT/good"
+"$POLICY" "$OUT/good" >"$OUT/good.log"
+grep -qx RESULT=PASS_ROUTER_BUNDLE_POLICY_R20 "$OUT/good.log"
+make_base "$OUT/bad-local"
+printf '#!/usr/bin/env bash\nset -Eeuo pipefail\nf(){ local expect="$1" log="x-${expect}.log"; :; }\n' >"$OUT/bad-local/install.sh"
+if "$POLICY" "$OUT/bad-local" >"$OUT/bad-local.log" 2>&1; then exit 20; fi
+grep -q bash_same_command_assignment_reference "$OUT/bad-local.log"
+make_base "$OUT/bad-pub"
+printf 'model_publication\n' >>"$OUT/bad-pub/install.sh"
+if "$POLICY" "$OUT/bad-pub" >"$OUT/bad-pub.log" 2>&1; then exit 21; fi
+grep -q publication_safe_payload_missing "$OUT/bad-pub.log"
+make_base "$OUT/bad-degraded"
+printf '{"functional_stage":"degraded_pool"}\n' >"$OUT/bad-degraded/release-info.json"
+if "$POLICY" "$OUT/bad-degraded" >"$OUT/bad-degraded.log" 2>&1; then exit 22; fi
+grep -q degraded_metadata_mismatch "$OUT/bad-degraded.log"
+echo RESULT=PASS_ROUTER_WORKFLOW_R20_SELFTEST
+echo R20_CONTRACT_VERSION="$R20_CONTRACT_VERSION"
+echo RUNTIME_IMPACT=false

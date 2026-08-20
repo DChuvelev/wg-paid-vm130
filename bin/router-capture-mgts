@@ -1,0 +1,130 @@
+#!/bin/sh
+set -u
+
+LABEL="${1:-mgts}"
+TS="$(date +%Y%m%d-%H%M%S)"
+BASE="/opt/router-ops/captures/${TS}_${LABEL}"
+RAW="$BASE/raw"
+REPORT="$BASE/REPORT.txt"
+ARCHIVE="$BASE.tar.gz"
+
+mkdir -p "$RAW"
+
+PVE="pve-mgts"
+PVE_KEY="/root/.ssh/pve_to_openwrt_mgts_ed25519"
+
+sanitize() {
+  sed -E \
+    -e "s/(private_key=')[^']+(')/\1<REDACTED>\2/g" \
+    -e "s/(private_key=)[^[:space:]]+/\1<REDACTED>/Ig" \
+    -e "s/(PrivateKey[[:space:]]*=[[:space:]]*).*/\1<REDACTED>/Ig" \
+    -e "s/(HMN_ACCESS_CODE=).*/\1<REDACTED>/Ig" \
+    -e "s/(ACCESS_CODE=).*/\1<REDACTED>/Ig" \
+    -e "s/(PASSWORD=).*/\1<REDACTED>/Ig" \
+    -e "s/(TOKEN=).*/\1<REDACTED>/Ig" \
+    -e "s/(SECRET=).*/\1<REDACTED>/Ig" \
+    -e "s/(API_KEY=).*/\1<REDACTED>/Ig"
+}
+
+section() {
+  NAME="$1"
+  shift
+  FILE="$RAW/$NAME.txt"
+
+  {
+    echo "===== $NAME ====="
+    echo "CMD: $*"
+    echo
+    "$@"
+    RC="$?"
+    echo
+    echo "rc=$RC"
+  } >"$FILE" 2>&1
+
+  {
+    echo
+    echo "################################################################"
+    echo "### $NAME"
+    echo "################################################################"
+    echo
+    cat "$FILE" | sanitize
+  } >>"$REPORT"
+}
+
+remote_pve() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$PVE" "$@"
+}
+
+remote_vm100() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$PVE" \
+    "ssh -n -i $PVE_KEY -o BatchMode=yes -o ConnectTimeout=8 root@10.71.100.1 '$*'"
+}
+
+remote_vm101() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 "$PVE" \
+    "ssh -n -i $PVE_KEY -o BatchMode=yes -o ConnectTimeout=8 root@10.71.100.2 '$*'"
+}
+
+remote_vm121() {
+  ssh -o BatchMode=yes -o ConnectTimeout=10 vm121 "$@"
+}
+
+cat >"$REPORT" <<EOF
+ROUTER CAPTURE REPORT
+timestamp: $TS
+label: $LABEL
+base: $BASE
+
+Secrets policy:
+- private keys redacted
+- access codes redacted
+- passwords/tokens redacted
+EOF
+
+section local_date date
+section local_access_map sh -c 'command -v access-map >/dev/null 2>&1 && access-map || true'
+section local_router_ops_tree sh -c 'find /opt/router-ops -maxdepth 3 -type f 2>/dev/null | sort | sed -n "1,500p"'
+
+section pve_qm_list remote_pve 'qm list'
+section pve_bridges remote_pve 'ip -br addr; echo; ip route; echo; bridge link'
+section pve_vm100_config remote_pve 'qm config 100'
+section pve_vm101_config remote_pve 'qm config 101'
+section pve_snapshots_100 remote_pve 'qm listsnapshot 100 || true'
+section pve_snapshots_101 remote_pve 'qm listsnapshot 101 || true'
+
+section vm100_basic remote_vm100 'date; uptime; ip -br addr; echo; ip route; echo; ip rule'
+section vm100_uci_network remote_vm100 'uci show network'
+section vm100_uci_firewall remote_vm100 'uci show firewall'
+section vm100_wg_show remote_vm100 'wg show'
+section vm100_relevant_files remote_vm100 'find /root /etc /usr/local /opt -maxdepth 4 -type f 2>/dev/null | grep -Ei "wg|paid|vpn|hmn|route|pbr|nft|firewall|status|readme" | sort | sed -n "1,600p"'
+
+section vm101_basic remote_vm101 'date; uptime; ip -br addr; echo; ip route; echo; ip rule'
+section vm101_uci_network remote_vm101 'uci show network'
+section vm101_uci_firewall remote_vm101 'uci show firewall'
+section vm101_wg_show remote_vm101 'wg show || true'
+section vm101_rt_nft remote_vm101 'cat /etc/iproute2/rt_tables 2>/dev/null; echo; nft list ruleset 2>/dev/null | sed -n "1,360p"'
+section vm101_services_cron remote_vm101 'ls /etc/init.d; echo; service 2>/dev/null | sed -n "1,260p"; echo; crontab -l 2>/dev/null || true; echo; cat /etc/crontabs/root 2>/dev/null || true'
+section vm101_hmn_tree remote_vm101 'ls -la /root 2>/dev/null; echo; find /root /etc /usr/local /opt -maxdepth 4 -type f 2>/dev/null | grep -Ei "hmn|hide|amnezia|awg|vpn|egress|wireguard|wg|status|readme|route|pbr" | sort | sed -n "1,900p"'
+
+section vm121_state remote_vm121 'date; ip -br addr; echo; ip route; echo; ls -la /opt/wg-access 2>/dev/null; echo; find /opt/wg-access -maxdepth 3 -type f 2>/dev/null | sort | sed -n "1,700p"; echo; docker ps 2>/dev/null; echo; systemctl list-units --type=service --type=timer 2>/dev/null | grep -Ei "wg|access|expire|router|docker" || true'
+
+{
+  echo
+  echo "################################################################"
+  echo "### RC SUMMARY"
+  echo "################################################################"
+  echo
+  grep -R "^rc=" "$RAW" | sort
+} >>"$REPORT"
+
+chmod -R go-rwx "$BASE" 2>/dev/null || true
+SAFE_ARCHIVE="$BASE.safe.tar.gz"
+tar -C "$BASE" -czf "$SAFE_ARCHIVE" REPORT.txt
+
+echo "REPORT=$REPORT"
+echo "SAFE_ARCHIVE=$SAFE_ARCHIVE"
+echo "RAW_LOCAL_ONLY=$RAW"
+ls -lh "$REPORT" "$SAFE_ARCHIVE"
+echo
+echo "=== RC SUMMARY ==="
+grep -R "^rc=" "$RAW" | sort

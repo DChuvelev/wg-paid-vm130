@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export ROUTER_MACHINE_GIT_PROFILE=/opt/router-ops/etc/router-machine-git-source.conf
+exec /opt/router-ops/bin/router-machine-git-publish "$@"

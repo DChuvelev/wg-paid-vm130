@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+OUT="${1:-/tmp/router-workflow-r19-selftest.$$}"; rm -rf "$OUT"; mkdir -p "$OUT"
+POLICY="${ROUTER_BUNDLE_POLICY_R19:-/opt/router-ops/bin/router-bundle-policy-r19}"; GATE="${ROUTER_BUNDLE_GATE_R19:-/opt/router-ops/bin/router-bundle-gate}"; MCS="${ROUTER_MACHINE_CLOSE_SAFE:-/opt/router-ops/bin/router-machine-close-safe}"; TRANS="${ROUTER_RUNTIME_TRANSITION_LIB:-/opt/router-ops/lib/router-runtime-transition.sh}"
+make_bundle(){ local d="$1"; rm -rf "$d"; mkdir -p "$d/tests" "$d/scripts"; cat >"$d/install.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+stop(){ :; }
+trap 'stop' ERR
+EOF
+chmod 700 "$d/install.sh"; cat >"$d/release-info.json" <<'EOF'
+{"step_id":"SELFTEST","revision":"R01","classification":"core","expected_installer_sha256":"x","mandatory_fixture_count":1,"runtime_impact":false}
+EOF
+cat >"$d/tests/ok.sh" <<'EOF'
+#!/bin/sh
+set -eu
+echo RESULT=PASS_SELFTEST
+EOF
+chmod 700 "$d/tests/ok.sh"; echo ok.sh >"$d/tests/mandatory.list"; : >"$d/tests/diagnostic.list"; (cd "$d" && find . -type f ! -name manifest.sha256 -print | LC_ALL=C sort | while read -r f; do sha256sum "${f#./}"; done >manifest.sha256); }
+BASE="$OUT/valid"; make_bundle "$BASE"; "$POLICY" "$BASE" >"$OUT/policy-valid.log"; grep -qx RESULT=PASS_ROUTER_BUNDLE_POLICY_R19 "$OUT/policy-valid.log"
+reject(){ local name="$1"; shift; local d="$OUT/$name"; cp -a "$BASE" "$d"; "$@" "$d"; set +e; "$POLICY" "$d" >"$OUT/$name.log" 2>&1; rc=$?; set -e; [[ "$rc" -ne 0 ]] || { echo "SELFTEST_REJECT_FAILED=$name"; exit 1; }; }
+mut_unzip(){ echo 'unzip x.zip' >>"$1/install.sh"; }
+mut_busybox(){ printf '#!/bin/sh\nfind /tmp -printf "%%p\\n"\n' >"$1/scripts/vm101.sh"; }
+mut_git(){ printf '#!/bin/sh\ngit --git-dir=/root/.vm101-source.git ls-tree -r --name-only HEAD\n' >"$1/scripts/vm101.sh"; }
+mut_close(){ echo '/opt/router-ops/bin/router-machine-close VM101 x' >>"$1/install.sh"; }
+mut_rollback(){ printf '\nrollback_now(){ rm -f /state; }\n' >>"$1/install.sh"; }
+mut_rank(){ echo '/root/hmn/hmn-rank-awg.sh x' >>"$1/install.sh"; }
+mut_path(){ cat >>"$1/install.sh" <<'EOF'
+GENERATION_STAGING_DIR=/var/lib/x
+x="$(readlink -f /var/lib/x/a)"
+case "$x" in "$GENERATION_STAGING_DIR"/*) ;; *) echo STOP_ACTIVE_GENERATION_PATH_INVALID;; esac
+EOF
+}
+mut_cont(){ python3 - "$1/release-info.json" <<'EOF'
+import json,sys
+p=sys.argv[1]; x=json.load(open(p)); x['classification']='continuation'; json.dump(x,open(p,'w'))
+EOF
+}
+reject reject-unzip mut_unzip; reject reject-busybox mut_busybox; reject reject-git mut_git; reject reject-machine-close mut_close; reject reject-rollback mut_rollback; reject reject-ranker mut_rank; reject reject-path mut_path; reject reject-continuation mut_cont
+cat >"$OUT/fake-legacy" <<'EOF'
+#!/bin/sh
+echo RESULT=PASS_ROUTER_BUNDLE_GATE
+EOF
+cat >"$OUT/fake-policy" <<'EOF'
+#!/bin/sh
+echo RESULT=PASS_ROUTER_BUNDLE_POLICY_R19
+EOF
+cat >"$OUT/fake-policy20" <<'EOF'
+#!/bin/sh
+echo RESULT=PASS_ROUTER_BUNDLE_POLICY_R20
+EOF
+chmod 700 "$OUT/fake-legacy" "$OUT/fake-policy" "$OUT/fake-policy20"
+ROUTER_BUNDLE_GATE_LEGACY="$OUT/fake-legacy" ROUTER_BUNDLE_POLICY_R19="$OUT/fake-policy" ROUTER_BUNDLE_POLICY_R20="$OUT/fake-policy20" "$GATE" "$BASE" >"$OUT/gate.log"
+grep -qx RESULT=PASS_ROUTER_BUNDLE_GATE_R19 "$OUT/gate.log"
+grep -qx RESULT=PASS_ROUTER_BUNDLE_GATE_R20 "$OUT/gate.log"
+grep -qx RESULT=PASS_ROUTER_BUNDLE_GATE "$OUT/gate.log"
+cat >"$OUT/fake-close" <<'EOF'
+#!/bin/sh
+[ "$#" -eq 2 ] && [ "$1" = vm101 ] && [ "$2" = test ]
+echo RESULT=PASS_FAKE_CLOSE
+EOF
+chmod 700 "$OUT/fake-close"; ROUTER_MACHINE_CLOSE_BIN="$OUT/fake-close" "$MCS" VM101 test >"$OUT/machine-close.log"; grep -qx RESULT=PASS_FAKE_CLOSE "$OUT/machine-close.log"
+source "$TRANS"; S="$OUT/transition.env"; router_runtime_transition_init "$S"; ! router_runtime_transition_rollback_allowed "$S"; router_runtime_transition_set "$S" BACKUP_READY true; router_runtime_transition_rollback_allowed "$S"; router_runtime_transition_set "$S" CORE_CHANGE_COMPLETE true; ! router_runtime_transition_rollback_allowed "$S"
+echo RESULT=PASS_ROUTER_WORKFLOW_R19_SELFTEST; echo POLICY_NEGATIVE_CASES=8; echo MACHINE_CLOSE_NORMALIZATION=PASS; echo RUNTIME_TRANSITION_GUARD=PASS

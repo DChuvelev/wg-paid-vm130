@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+exec \
+  /opt/router-ops/state/local-plans/vm101-hmn-autonomous-egress-recovery/republish.sh \
+  "$@"

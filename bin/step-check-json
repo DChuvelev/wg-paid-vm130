@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import re
+from pathlib import Path
+
+MISSING = object()
+
+def parse_expected(raw: str):
+    if raw == "true":
+        return True
+    if raw == "false":
+        return False
+    if raw == "null":
+        return None
+    if re.fullmatch(r"-?\d+", raw):
+        return int(raw)
+    if re.fullmatch(r"-?\d+\.\d+", raw):
+        return float(raw)
+    return raw
+
+def stringify(value):
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if value is None:
+        return "null"
+    return str(value)
+
+def get_path(data, path: str):
+    cur = data
+
+    if path == "":
+        return cur
+
+    for part in path.split("."):
+        if isinstance(cur, list):
+            if not re.fullmatch(r"\d+", part):
+                return MISSING
+            idx = int(part)
+            if idx < 0 or idx >= len(cur):
+                return MISSING
+            cur = cur[idx]
+            continue
+
+        if not isinstance(cur, dict):
+            return MISSING
+
+        if part not in cur:
+            return MISSING
+
+        cur = cur[part]
+
+    return cur
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Check JSON facts by path=value expectations. No shell source/env parsing."
+    )
+    parser.add_argument("--pretty", action="store_true")
+    parser.add_argument("--dump", action="store_true")
+    parser.add_argument("json_file")
+    parser.add_argument("expectations", nargs="*")
+    args = parser.parse_args()
+
+    try:
+        data = json.loads(Path(args.json_file).read_text(encoding="utf-8", errors="replace"))
+    except Exception as e:
+        print(f"CHECK_JSON_LOAD_FAIL file={args.json_file} error={type(e).__name__}: {e}")
+        return 2
+
+    if args.dump:
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    failures = []
+
+    for item in args.expectations:
+        if "=" not in item:
+            failures.append((item, "INVALID_EXPECTATION_NO_EQUALS", "", ""))
+            continue
+
+        path, raw_expected = item.split("=", 1)
+        expected = parse_expected(raw_expected)
+        actual = get_path(data, path)
+
+        if actual is MISSING:
+            failures.append((path, "MISSING", stringify(expected), ""))
+            continue
+
+        if actual != expected and stringify(actual) != stringify(expected):
+            failures.append((path, stringify(actual), stringify(expected), type(actual).__name__))
+
+    if failures:
+        for path, actual, expected, actual_type in failures:
+            print(f"CHECK_FAIL path={path} actual={actual} expected={expected} actual_type={actual_type}")
+        print(f"CHECK_RESULT=FAIL failure_count={len(failures)}")
+        return 1
+
+    if args.pretty:
+        print(f"CHECK_RESULT=PASS expectation_count={len(args.expectations)}")
+
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

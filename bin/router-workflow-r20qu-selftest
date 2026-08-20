@@ -1,0 +1,200 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+OUT="${1:-$(mktemp -d /tmp/router-workflow-r20qu.XXXXXX)}"
+rm -rf "$OUT"
+mkdir -p "$OUT"
+
+source "$BASE/lib/router-target-contract.sh"
+source "$BASE/lib/router-direct-state-oracle.sh"
+source "$BASE/lib/router-core-boundary.sh"
+source "$BASE/lib/router-step-workflow.sh"
+
+cat > "$OUT/matrix.tsv" <<'EOF'
+VM130	bash	bash,python3	busybox,zip
+PVE	bash	bash,qm	openwrt-paths-local
+VM100	posix-sh	busybox	bash,find-printf
+VM101	posix-sh	busybox,amneziawg	bash,find-printf
+EOF
+router_target_matrix_validate "$OUT/matrix.tsv"
+
+cat > "$OUT/ownership.tsv" <<'EOF'
+VM130	durable	true	/opt/router-ops
+PVE	durable	true	/etc/pve
+VM100	durable	true	/etc/router-wgpay-selector.d
+VM101	runtime	false	/var/lib/router-egress-recovery
+VM101	optional	false	/var/lib/router-egress-recovery/generations/staging
+EOF
+router_path_ownership_validate "$OUT/ownership.tsv"
+router_path_owner_assert "$OUT/ownership.tsv" VM101 /var/lib/router-egress-recovery > "$OUT/owner-pass.log"
+if router_path_owner_assert "$OUT/ownership.tsv" PVE /var/lib/router-egress-recovery > "$OUT/owner-fail.log" 2>&1; then
+    exit 20
+fi
+
+router_direct_state_oracle "$OUT/absent" > "$OUT/direct-absent.log"
+cat > "$OUT/direct.env" <<'EOF'
+schema=router-wgpay-direct-mode-state-v1
+active=false
+mode=NORMAL
+EOF
+router_direct_state_oracle "$OUT/direct.env" > "$OUT/direct-normal.log"
+sed -i 's/active=false/active=true/' "$OUT/direct.env"
+if router_direct_state_oracle "$OUT/direct.env" > "$OUT/direct-active.log" 2>&1; then
+    exit 21
+fi
+
+cat > "$OUT/child.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo APPLY_STAGE=installed
+echo CORE_CHANGE_COMPLETE=true
+exit 7
+EOF
+chmod 700 "$OUT/child.sh"
+router_core_boundary_run "$OUT/child.log" -- "$OUT/child.sh"
+[[ "$ROUTER_CORE_CHILD_RC" -eq 7 ]]
+[[ "$ROUTER_CORE_CHANGE_COMPLETE" == true ]]
+! router_core_rollback_allowed
+
+printf x > "$OUT/file.txt"
+printf '%s  file.txt\n' "$(sha256sum "$OUT/file.txt" | awk '{print $1}')" > "$OUT/ref.sha256"
+"$BASE/bin/router-reference-sha" validate "$OUT/ref.sha256" > "$OUT/ref-valid.log"
+"$BASE/bin/router-reference-sha" verify "$OUT/ref.sha256" "$OUT" > "$OUT/ref-verify.log"
+printf 'bad  file.txt\n' > "$OUT/bad.sha256"
+if "$BASE/bin/router-reference-sha" validate "$OUT/bad.sha256" > "$OUT/ref-bad.log" 2>&1; then
+    exit 22
+fi
+
+if [[ "${ROUTER_R20QU_SELFTEST_SKIP_NESTED_DETACHED:-false}" == true ]]; then
+    echo DETACHED_RUNNER_NESTED_SELFTEST=skipped_outer_gate
+else
+STEP=SELFTEST_DETACHED
+mkdir -p "$OUT/bundle/$STEP/scripts" "$OUT/runtime/bin" "$OUT/source/bin" "$OUT/incoming" "$OUT/home"
+cat > "$OUT/bundle/$STEP/scripts/run.sh" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "\${ROUTER_OPS_BASE:?}" == "$OUT/runtime" ]]
+[[ "\${ROUTER_VM130_SOURCE_ROOT:?}" == "$OUT/source" ]]
+[[ "\${ROUTER_STEP_INCOMING:?}" == "$OUT/incoming" ]]
+echo PROGRESS_SELFTEST=started
+sleep 3
+echo RESULT=PASS_SELFTEST_DETACHED_CHILD
+EOF
+chmod 700 "$OUT/bundle/$STEP/scripts/run.sh"
+"$BASE/bin/router-zip-contract" build --source "$OUT/bundle/$STEP" --output "$OUT/$STEP.zip" --root "$STEP" >/dev/null
+detached_sha="$(sha256sum "$OUT/$STEP.zip" | awk '{print $1}')"
+ROUTER_DETACHED_ROOT="$OUT/detached" ROUTER_OPS_BASE="$BASE" "$BASE/bin/router-detached-step" \
+    start --step "$STEP" --zip "$OUT/$STEP.zip" --sha256 "$detached_sha" --entry scripts/run.sh \
+    --runtime-base "$OUT/runtime" --source-root "$OUT/source" --incoming "$OUT/incoming" \
+    --public-token-file "$OUT/runtime/public/.router-public-token" --home "$OUT/home" > "$OUT/start.log"
+set +e
+ROUTER_DETACHED_ROOT="$OUT/detached" ROUTER_OPS_BASE="$BASE" "$BASE/bin/router-detached-step" \
+    start --step "$STEP" --zip "$OUT/$STEP.zip" --sha256 "$detached_sha" --entry scripts/run.sh \
+    --runtime-base "$OUT/runtime" --source-root "$OUT/source" --incoming "$OUT/incoming" \
+    --public-token-file "$OUT/runtime/public/.router-public-token" --home "$OUT/home" > "$OUT/second.log" 2>&1
+second_rc=$?
+set -e
+[[ "$second_rc" -eq 20 ]] || { echo "DETACHED_SECOND_START_RC=$second_rc" >&2; cat "$OUT/second.log" >&2; exit 23; }
+grep -qx RESULT=STOP_DETACHED_RUNNER_ALREADY_ACTIVE "$OUT/second.log"
+pid="$(cat "$OUT/detached/$STEP/runs/$(cat "$OUT/detached/$STEP/current-run")/pid")"
+[[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]]
+control="$OUT/detached/$STEP/control.sh"
+"$control" status > "$OUT/status.log"
+run_id="$(cat "$OUT/detached/$STEP/current-run")"
+for _ in $(seq 1 100); do [[ -f "$OUT/detached/$STEP/runs/$run_id/result.env" ]] && break; sleep 0.05; done
+[[ -f "$OUT/detached/$STEP/runs/$run_id/result.env" ]]
+"$control" follow > "$OUT/follow.log"
+"$control" result > "$OUT/result.log"
+grep -qx RUNNER_STATE=complete "$OUT/result.log"
+grep -qx CHILD_FINAL_RESULT=PASS_SELFTEST_DETACHED_CHILD "$OUT/result.log"
+grep -Fqx "RUNNER_RUNTIME_BASE=$OUT/runtime" "$OUT/result.log"
+grep -Fqx "RUNNER_SOURCE_ROOT=$OUT/source" "$OUT/result.log"
+! find "$OUT/detached" -name 'result.env.tmp.*' -print -quit | grep -q .
+
+fi
+
+BSTEP=SELFTEST_BOOTSTRAP
+mkdir -p "$OUT/bootstrap/$BSTEP/tests" "$OUT/bootstrap/$BSTEP/payload"
+cat > "$OUT/bootstrap/$BSTEP/install.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo RESULT=PASS_UNUSED
+EOF
+cat > "$OUT/bootstrap/$BSTEP/tool.py" <<'EOF'
+#!/usr/bin/env python3
+print("ok")
+EOF
+printf 'a\0b' > "$OUT/bootstrap/$BSTEP/payload/binary.dat"
+cat > "$OUT/bootstrap/$BSTEP/tests/ok.sh" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo RESULT=PASS_BOOT_FIXTURE
+EOF
+printf 'ok.sh\n' > "$OUT/bootstrap/$BSTEP/tests/mandatory.list"
+chmod 700 "$OUT/bootstrap/$BSTEP/install.sh" "$OUT/bootstrap/$BSTEP/tool.py" "$OUT/bootstrap/$BSTEP/tests/ok.sh"
+installer_sha="$(sha256sum "$OUT/bootstrap/$BSTEP/install.sh" | awk '{print $1}')"
+printf '{"step_id":"%s","expected_installer_sha256":"%s"}\n' "$BSTEP" "$installer_sha" > "$OUT/bootstrap/$BSTEP/release-info.json"
+(
+    cd "$OUT/bootstrap/$BSTEP"
+    find . -type f ! -name manifest.sha256 -print | LC_ALL=C sort |
+        while read -r file; do sha256sum "${file#./}"; done > manifest.sha256
+)
+"$BASE/bin/router-zip-contract" build --source "$OUT/bootstrap/$BSTEP" --output "$OUT/$BSTEP.zip" --root "$BSTEP" > "$OUT/bootstrap-build.log"cat > "$OUT/fake-gate" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+echo RESULT=PASS_FAKE_GATE
+EOF
+chmod 700 "$OUT/fake-gate"
+bootstrap_zip_sha="$(sha256sum "$OUT/$BSTEP.zip" | awk '{print $1}')"
+ROUTER_BUNDLE_GATE="$OUT/fake-gate" "$BASE/bin/router-step-bootstrap" --verify-only \
+    "$OUT/$BSTEP.zip" "$bootstrap_zip_sha" "$installer_sha" > "$OUT/bootstrap.log" 2>&1
+! grep -qi 'null byte' "$OUT/bootstrap.log"
+! find "$OUT/bootstrap" \( -name __pycache__ -o -name '*.pyc' \) -print -quit | grep -q .
+
+# Shared Python latest archiver proof with a synthetic publication tree.
+ARCHIVE_BASE="$OUT/archive-base"
+ARCHIVE_INCOMING="$OUT/archive-incoming"
+mkdir -p "$ARCHIVE_BASE/public/r/token/latest/sample"
+printf 'token\n' > "$ARCHIVE_BASE/public/.router-public-token"
+printf 'sample\n' > "$ARCHIVE_BASE/public/r/token/latest/sample/report.txt"
+router_step_archive_latest_python "$ARCHIVE_BASE" "$ARCHIVE_INCOMING" 20000101-000000 > "$OUT/archive.log"
+grep -qx RESULT=PASS_ROUTER_STEP_ARCHIVE_LATEST "$OUT/archive.log"
+[[ -f "$ARCHIVE_INCOMING/WG_PAID_MGTS_LATEST_20000101-000000.zip" ]]
+
+echo RESULT=PASS_ROUTER_WORKFLOW_R20QU_SELFTEST
+echo TARGET_CONTRACT=PASS
+echo DIRECT_ORACLE=PASS
+echo CORE_BOUNDARY_PROPAGATION=PASS
+echo REFERENCE_SHA=PASS
+echo DETACHED_RUNNER=PASS
+echo FAILURE_ARCHIVE_HELPER=PASS
+echo BOOTSTRAP_NULL_BYTE_FIX=PASS
+echo RUNTIME_IMPACT=false
+
+# R20Q-U-A2 canonical ZIP and release-contract selftests.
+ZIP_FIX="$OUT/zip-contract"
+rm -rf "$ZIP_FIX"; mkdir -p "$ZIP_FIX/source/STEP_X/scripts" "$ZIP_FIX/extract"
+printf '#!/usr/bin/env bash\necho ok\n' > "$ZIP_FIX/source/STEP_X/scripts/run.sh"
+printf 'data\n' > "$ZIP_FIX/source/STEP_X/data.txt"
+chmod 2755 "$ZIP_FIX/source/STEP_X/scripts"
+chmod 755 "$ZIP_FIX/source/STEP_X/scripts/run.sh"
+"$BASE/bin/router-zip-contract" build --source "$ZIP_FIX/source/STEP_X" --output "$ZIP_FIX/canonical.zip" --root STEP_X > "$ZIP_FIX/build.log"
+"$BASE/bin/router-zip-contract" verify --zip "$ZIP_FIX/canonical.zip" --root STEP_X --canonical > "$ZIP_FIX/verify.log"
+"$BASE/bin/router-zip-contract" extract --zip "$ZIP_FIX/canonical.zip" --destination "$ZIP_FIX/extract" --root STEP_X --canonical > "$ZIP_FIX/extract.log"
+[[ "$(stat -c %a "$ZIP_FIX/extract/STEP_X/scripts")" == 700 ]]
+[[ "$(stat -c %a "$ZIP_FIX/extract/STEP_X/scripts/run.sh")" == 700 ]]
+[[ "$(stat -c %a "$ZIP_FIX/extract/STEP_X/data.txt")" == 600 ]]
+python3 - "$ZIP_FIX/legacy.zip" <<'PY'
+import stat,sys,zipfile
+z=zipfile.ZipFile(sys.argv[1],'w')
+d=zipfile.ZipInfo('STEP_X/scripts/'); d.create_system=3; d.external_attr=((stat.S_IFDIR|0o2755)<<16)|0x10; z.writestr(d,b'')
+f=zipfile.ZipInfo('STEP_X/scripts/run.sh'); f.create_system=3; f.external_attr=((stat.S_IFREG|0o755)<<16); z.writestr(f,b'#!/bin/sh\n')
+z.close()
+PY
+if "$BASE/bin/router-zip-contract" verify --zip "$ZIP_FIX/legacy.zip" --root STEP_X --canonical >/dev/null 2>&1; then exit 90; fi
+rm -rf "$ZIP_FIX/legacy-extract"
+"$BASE/bin/router-zip-contract" extract --zip "$ZIP_FIX/legacy.zip" --destination "$ZIP_FIX/legacy-extract" --root STEP_X >/dev/null
+[[ "$(stat -c %a "$ZIP_FIX/legacy-extract/STEP_X/scripts")" == 700 ]]
+[[ "$(stat -c %a "$ZIP_FIX/legacy-extract/STEP_X/scripts/run.sh")" == 700 ]]
+echo RESULT=PASS_ROUTER_WORKFLOW_R20QU_A2_ZIP_CONTRACT_SELFTEST
+echo RESULT=PASS_ROUTER_WORKFLOW_R20QU_SELFTEST

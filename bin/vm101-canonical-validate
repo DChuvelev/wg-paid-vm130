@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE="/opt/router-ops/state/current-vm101-canonical.env"
+PUBLIC_ROOT="/opt/router-ops/public/r/e94a0859747d7b96f29c7fdafc2d0351ba603bb0a7e9e5a4/vm101-canonical"
+CURRENT="${PUBLIC_ROOT}/current"
+
+fail() {
+  echo "VALIDATION_PASS=false"
+  echo "reason=$1"
+  exit 1
+}
+
+[ -s "$STATE" ] ||
+  fail "state_missing"
+
+value() {
+  sed -n "s/^${1}=//p" "$STATE" |
+    tail -n1
+}
+
+EXPECTED_ID="$(value VM101_CANONICAL_ID)"
+WORKSPACE="$(value VM101_CANONICAL_PRIVATE_WORKSPACE)"
+STATUS="$(value VM101_CANONICAL_STATUS)"
+
+[ -n "$EXPECTED_ID" ] ||
+  fail "expected_id_empty"
+
+[ -n "$WORKSPACE" ] ||
+  fail "workspace_empty"
+
+for required in \
+  "$CURRENT/canonical-manifest.json" \
+  "$CURRENT/contracts/edit-map.json" \
+  "$CURRENT/contracts/replacement-blueprints.json" \
+  "$CURRENT/secret-scan.json" \
+  "$CURRENT/SHA256SUMS" \
+  "$WORKSPACE/contracts/edit-map-private.json" \
+  "$WORKSPACE/contracts/replacement-blueprints.json" \
+  "$WORKSPACE/contracts/source-locks.tsv" \
+  "$WORKSPACE/SHA256SUMS"
+do
+  [ -s "$required" ] ||
+    fail "required_missing:$required"
+done
+
+CURRENT_ID="$(
+  python3 - "$CURRENT/canonical-manifest.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print(data["canonical_id"])
+PY
+)"
+
+PRIVATE_ID="$(
+  python3 - "$WORKSPACE/contracts/edit-map-private.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print(data["canonical_id"])
+PY
+)"
+
+TARGET_STATUS="$(
+  python3 - "$CURRENT/contracts/edit-map.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+
+print(
+    f"{data['edit_ready_target_count']}/"
+    f"{data['target_count']}"
+)
+PY
+)"
+
+BLUEPRINT_TARGETS="$(
+  python3 - "$CURRENT/contracts/replacement-blueprints.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print(len(data["targets"]))
+PY
+)"
+
+SECRET_FINDINGS="$(
+  python3 - "$CURRENT/secret-scan.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+print(data["finding_count"])
+PY
+)"
+
+[ "$CURRENT_ID" = "$EXPECTED_ID" ] ||
+  fail "current_id_mismatch:$CURRENT_ID:$EXPECTED_ID"
+
+[ "$PRIVATE_ID" = "$EXPECTED_ID" ] ||
+  fail "private_id_mismatch:$PRIVATE_ID:$EXPECTED_ID"
+
+[ "$TARGET_STATUS" = "9/9" ] ||
+  fail "edit_ready_targets:$TARGET_STATUS"
+
+[ "$BLUEPRINT_TARGETS" = "9" ] ||
+  fail "blueprint_targets:$BLUEPRINT_TARGETS"
+
+[ "$SECRET_FINDINGS" = "0" ] ||
+  fail "secret_findings:$SECRET_FINDINGS"
+
+(
+  cd "$CURRENT"
+  sha256sum -c SHA256SUMS
+) >/dev/null ||
+  fail "current_sha256_failed"
+
+(
+  cd "$WORKSPACE"
+  sha256sum -c SHA256SUMS
+) >/dev/null ||
+  fail "private_sha256_failed"
+
+echo "VALIDATION_PASS=true"
+echo "canonical_id=$EXPECTED_ID"
+echo "current_id=$CURRENT_ID"
+echo "private_id=$PRIVATE_ID"
+echo "status=$STATUS"
+echo "edit_ready_targets=$TARGET_STATUS"
+echo "blueprint_targets=$BLUEPRINT_TARGETS"
+echo "secret_findings=$SECRET_FINDINGS"
+echo "workspace=$WORKSPACE"

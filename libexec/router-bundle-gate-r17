@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+DIR="${1:?bundle directory required}"
+[[ -d "$DIR" && -f "$DIR/manifest.sha256" && -f "$DIR/install.sh" ]] || { echo RESULT=STOP_ROUTER_BUNDLE_GATE_LAYOUT; exit 2; }
+(cd "$DIR" && sha256sum -c manifest.sha256) >/dev/null
+python3 -m json.tool "$DIR/release-info.json" >/dev/null
+
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+contract_version="$(python3 - "$DIR/release-info.json" <<'PYV'
+import json,sys
+print(int(json.load(open(sys.argv[1],encoding='utf-8')).get('workflow_contract_version') or 0))
+PYV
+)"
+if [[ "$contract_version" -ge 2 ]]; then
+  "$BASE/bin/router-release-contract" verify --root "$DIR"
+  grep -Fqx exact-worker.sh "$DIR/tests/mandatory.list"
+fi
+if find "$DIR" \( -type d -name __pycache__ -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) -print -quit | grep -q .; then
+  echo RESULT=STOP_ROUTER_BUNDLE_GATE_PYTHON_BYTECODE
+  exit 2
+fi
+python3 - "$DIR" <<'PYCLASS' | while IFS=$'\t' read -r kind file; do
+import sys
+from pathlib import Path
+root=Path(sys.argv[1])
+for p in sorted(x for x in root.rglob('*') if x.is_file()):
+    try: first=p.open('rb').readline(256).decode('ascii','ignore').rstrip('\r\n')
+    except OSError: continue
+    kind={'#!/usr/bin/env bash':'bash','#!/bin/bash':'bash','#!/bin/sh':'sh','#!/bin/ash':'sh','#!/usr/bin/env python3':'python','#!/usr/bin/python3':'python'}.get(first)
+    if kind: print(f'{kind}\t{p}')
+PYCLASS
+  case "$kind" in
+    bash) bash -n "$file"; chmod 700 "$file" ;;
+    sh) sh -n "$file"; chmod 700 "$file" ;;
+    python)
+      python3 - "$file" <<'PYCHECK'
+import sys
+from pathlib import Path
+p=Path(sys.argv[1]); compile(p.read_bytes(),str(p),'exec')
+PYCHECK
+      chmod 700 "$file"
+      ;;
+  esac
+done
+LIST="$DIR/tests/mandatory.list"
+[[ -f "$LIST" ]] || { echo RESULT=STOP_ROUTER_BUNDLE_GATE_MANDATORY_LIST; exit 2; }
+count=0
+while IFS= read -r rel; do
+  [[ -n "$rel" && "${rel#\#}" == "$rel" ]] || continue
+  f="$DIR/tests/$rel"
+  [[ -f "$f" ]] || { echo RESULT=STOP_ROUTER_BUNDLE_GATE_FIXTURE_MISSING; echo "FIXTURE=$rel"; exit 2; }
+  bash "$f"
+  count=$((count+1))
+done < "$LIST"
+echo RESULT=PASS_ROUTER_BUNDLE_GATE
+echo "MANDATORY_FIXTURE_COUNT=$count"
+echo DIAGNOSTIC_FIXTURES_EXECUTED=false

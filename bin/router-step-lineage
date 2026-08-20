@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+TOKEN_FILE="${ROUTER_PUBLIC_TOKEN_FILE:-$BASE/public/.router-public-token}"
+TOKEN="${ROUTER_PUBLIC_TOKEN:-$(cat "$TOKEN_FILE")}"; ROOT="${ROUTER_PUBLIC_ROOT:-$BASE/public/r/$TOKEN}"
+MARKER=""; VALUE=""; while (($#)); do case "$1" in --marker) MARKER="$2"; shift 2;; --value) VALUE="$2"; shift 2;; *) echo RESULT=STOP_ROUTER_STEP_LINEAGE_USAGE; exit 2;; esac; done
+[[ -n "$MARKER" ]] || { echo RESULT=STOP_ROUTER_STEP_LINEAGE_USAGE; exit 2; }
+count=0
+for zone in latest old; do
+  while IFS= read -r dir; do
+    [[ -d "$dir" ]] || continue
+    matched=false
+    for f in "$dir/report.txt" "$dir/verify.txt" "$dir/facts.json"; do
+      [[ -f "$f" ]] || continue
+      if [[ -n "$VALUE" ]]; then grep -Fq "$MARKER=$VALUE" "$f" && matched=true
+      else grep -Fq "$MARKER" "$f" && matched=true
+      fi
+    done
+    if [[ "$matched" == true ]]; then printf 'LINEAGE_ITEM=%s	%s
+' "$zone" "$(basename "$dir")"; count=$((count+1)); fi
+  done < <(find "$ROOT/$zone" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | LC_ALL=C sort)
+done
+echo "LINEAGE_COUNT=$count"; echo RESULT=PASS_ROUTER_STEP_LINEAGE

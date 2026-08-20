@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+LIB="/opt/router-ops/lib/machine-git-count-contract.sh"
+[ -r "$LIB" ] || { echo "ERROR: missing $LIB" >&2; exit 2; }
+# shellcheck source=/opt/router-ops/lib/machine-git-count-contract.sh
+. "$LIB"
+
+GIT_DIR=""
+WORK_TREE=""
+COMMIT="HEAD"
+FORMAT="shell"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --git-dir) GIT_DIR="$2"; shift 2 ;;
+    --work-tree) WORK_TREE="$2"; shift 2 ;;
+    --commit) COMMIT="$2"; shift 2 ;;
+    --json) FORMAT="json"; shift ;;
+    *) echo "ERROR: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+[ -n "$GIT_DIR" ] || { echo "ERROR: --git-dir is required" >&2; exit 2; }
+[ -n "$WORK_TREE" ] || { echo "ERROR: --work-tree is required" >&2; exit 2; }
+
+RESOLVED="$(git --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" rev-parse "$COMMIT^{commit}")"
+TREE="$(git --git-dir="$GIT_DIR" --work-tree="$WORK_TREE" rev-parse "$RESOLVED^{tree}")"
+TREE_COUNT="$(router_machine_git_tree_file_count "$GIT_DIR" "$WORK_TREE" "$RESOLVED")"
+ARCHIVE_COUNT="$(router_machine_git_archive_file_count "$GIT_DIR" "$WORK_TREE" "$RESOLVED")"
+[ "$TREE_COUNT" = "$ARCHIVE_COUNT" ] || {
+  echo "ERROR: GIT_TREE_FILE_COUNT=$TREE_COUNT differs from PUBLISHED_ARCHIVE_FILE_COUNT=$ARCHIVE_COUNT" >&2
+  exit 3
+}
+mapfile -t CHANGED < <(router_machine_git_changed_files "$GIT_DIR" "$WORK_TREE" "$RESOLVED")
+CHANGED_COUNT="${#CHANGED[@]}"
+
+if [ "$FORMAT" = "json" ]; then
+  python3 - "$RESOLVED" "$TREE" "$TREE_COUNT" "$ARCHIVE_COUNT" "$CHANGED_COUNT" "${CHANGED[@]}" <<'PY'
+import json, sys
+commit, tree, tc, ac, cc, *changed = sys.argv[1:]
+print(json.dumps({
+  "commit": commit,
+  "tree": tree,
+  "git_tree_file_count": int(tc),
+  "published_archive_file_count": int(ac),
+  "changed_file_count": int(cc),
+  "changed_files": changed,
+  "count_contract_pass": int(tc) == int(ac),
+}, ensure_ascii=False, indent=2))
+PY
+else
+  printf 'COMMIT=%s\n' "$RESOLVED"
+  printf 'TREE=%s\n' "$TREE"
+  printf 'GIT_TREE_FILE_COUNT=%s\n' "$TREE_COUNT"
+  printf 'PUBLISHED_ARCHIVE_FILE_COUNT=%s\n' "$ARCHIVE_COUNT"
+  printf 'CHANGED_FILE_COUNT=%s\n' "$CHANGED_COUNT"
+  printf 'CHANGED_FILES_BEGIN\n'
+  printf '%s\n' "${CHANGED[@]}"
+  printf 'CHANGED_FILES_END\n'
+  printf 'COUNT_CONTRACT_PASS=true\n'
+fi

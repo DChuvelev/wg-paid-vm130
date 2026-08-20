@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+POLICY_LIB="${ROUTER_PUBLICATION_POLICY_LIB:-$BASE/lib/router-publication-policy.sh}"
+[[ -r "$POLICY_LIB" ]] || { echo RESULT=STOP_ROUTER_PUBLISH_REPORT; echo STOP_CODE=POLICY_LIBRARY_MISSING; echo STOP_REASON="$POLICY_LIB"; exit 1; }
+source "$POLICY_LIB"
+PUBLIC="$BASE/public"
+PUBLIC_BASE="${ROUTER_PUBLIC_BASE_URL:-https://reports.secret-studio.ru}"
+PUBLIC_BASE="${PUBLIC_BASE%/}"
+TOKEN_FILE="${ROUTER_PUBLIC_TOKEN_FILE:-$PUBLIC/.router-public-token}"
+TOKEN="${ROUTER_PUBLIC_TOKEN:-}"
+[[ -n "$TOKEN" ]] || TOKEN="$(cat "$TOKEN_FILE")"
+ROOT="${ROUTER_PUBLIC_ROOT:-$PUBLIC/r/$TOKEN}"
+LATEST="$ROOT/latest"
+OLD="$ROOT/old"
+REINDEX="${ROUTER_PUBLIC_REINDEX:-$BASE/bin/router-public-reindex}"
+LOCK_DIR="$BASE/state/locks"
+LOCK_FILE="$LOCK_DIR/public-publish.lock"
+TS="${ROUTER_PUBLISH_TIMESTAMP_OVERRIDE:-$(date -u +%Y%m%d-%H%M%S)}"
+TRANSACTION_ID="${TS}_$$_${RANDOM}"
+
+stop_publish() {
+    local code="$1" reason="$2"
+    echo "RESULT=STOP_ROUTER_PUBLISH_REPORT"
+    echo "STOP_CODE=$code"
+    echo "STOP_REASON=$reason"
+    echo "PUBLICATION_TRANSACTION_ID=$TRANSACTION_ID"
+    exit 1
+}
+
+for command_name in awk sed grep find sha256sum cmp mktemp flock cp mv rm chmod mkdir date sort tac; do
+    command -v "$command_name" >/dev/null 2>&1 || stop_publish REQUIRED_COMMAND_MISSING "$command_name"
+done
+[[ -x "$REINDEX" ]] || stop_publish REINDEX_MISSING "$REINDEX"
+MODE=publish
+if [[ "${1:-}" == --classify ]]; then MODE=classify; shift; fi
+if [[ "${1:-}" == --preflight ]]; then MODE=preflight; shift; fi
+[[ $# -ge 1 ]] || stop_publish USAGE 'router-publish-report [--classify|--preflight] <label> [file1 ...]'
+LABEL_RAW="$1"
+shift
+LABEL="$(router_publication_label_sanitize "$LABEL_RAW")"
+[[ -n "$LABEL" ]] || LABEL=report
+IFS=$'\t' read -r KIND MATCH <<< "$(router_publication_classify "$LABEL")"
+
+if [[ "$MODE" == classify ]]; then
+    echo "LABEL=$LABEL"
+    echo "PUBLIC_OBJECT_KIND=$KIND"
+    echo "PUBLIC_MATCH=$MATCH"
+    echo RESULT=PASS_ROUTER_PUBLISH_CLASSIFY
+    exit 0
+fi
+
+if [[ "$MODE" == publish ]]; then
+    [[ $# -ge 1 ]] || stop_publish USAGE 'router-publish-report <label> <file1> [file2 ...]'
+fi
+
+
+FOLDER="${TS}_${LABEL}"
+STAGE_ROOT="$(mktemp -d "$BASE/state/public-publish-stage.${TRANSACTION_ID}.XXXXXX")"
+STAGE_DIR="$STAGE_ROOT/$FOLDER"
+MOVED_LIST="$STAGE_ROOT/moved-from-latest.txt"
+DEDUP_LIST="$STAGE_ROOT/deduplicated-from-latest.txt"
+NEW_MOVED=0
+COMMITTED=0
+PUBLISHED_DIR=''
+PUBLICATION_REUSED=false
+
+make_payload_manifest() {
+    local dir="$1" out="$2" name
+    : > "$out"
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        printf '%s  %s\n' "$(sha256sum "$dir/$name" | awk '{print $1}')" "$name" >> "$out"
+    done < <(find "$dir" -maxdepth 1 -type f ! -name index.html ! -name 'index.html.tmp.*' -printf '%f\n' | LC_ALL=C sort)
+}
+
+dirs_payload_equal() {
+    local a="$1" b="$2" ma="$STAGE_ROOT/manifest-a.$$" mb="$STAGE_ROOT/manifest-b.$$"
+    make_payload_manifest "$a" "$ma"
+    make_payload_manifest "$b" "$mb"
+    cmp -s "$ma" "$mb"
+}
+
+cleanup() {
+    local rc=$?
+    trap - EXIT INT TERM HUP
+    set +e
+    if [[ "$COMMITTED" -ne 1 ]]; then
+        if [[ "$NEW_MOVED" -eq 1 && -n "$PUBLISHED_DIR" && -d "$PUBLISHED_DIR" ]]; then
+            mv "$PUBLISHED_DIR" "$STAGE_DIR" 2>/dev/null || true
+        fi
+        if [[ -s "$MOVED_LIST" ]]; then
+            tac "$MOVED_LIST" | while IFS= read -r name; do
+                [[ -n "$name" ]] || continue
+                [[ -d "$OLD/$name" && ! -e "$LATEST/$name" ]] && mv "$OLD/$name" "$LATEST/$name" || true
+            done
+        fi
+        if [[ -s "$DEDUP_LIST" ]]; then
+            tac "$DEDUP_LIST" | while IFS=$'\t' read -r name backup; do
+                [[ -n "$name" && -d "$backup" && ! -e "$LATEST/$name" ]] && mv "$backup" "$LATEST/$name" || true
+            done
+        fi
+        "$REINDEX" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$STAGE_ROOT"
+    exit "$rc"
+}
+trap cleanup EXIT INT TERM HUP
+
+mkdir -p "$LATEST" "$OLD" "$LOCK_DIR" "$STAGE_DIR"
+chmod 755 "$ROOT" "$LATEST" "$OLD" "$STAGE_DIR"
+: > "$MOVED_LIST"
+: > "$DEDUP_LIST"
+exec 9>"$LOCK_FILE"
+flock -n 9 || stop_publish LOCKED another_publication_is_running
+
+for src in "$@"; do
+    [[ -f "$src" ]] || stop_publish FILE_MISSING "$src"
+    base_src="$(basename "$src")"
+    [[ ! -e "$STAGE_DIR/$base_src" ]] || stop_publish DUPLICATE_BASENAME "$base_src"
+    if ! router_publication_name_allowed "$base_src"; then
+        stop_publish SUSPICIOUS_PATH "$src"
+    fi
+    cp -a "$src" "$STAGE_DIR/$base_src"
+    chmod 644 "$STAGE_DIR/$base_src"
+done
+
+mapfile -t CURRENT_MATCHES < <(
+    if [[ "$KIND" == access-map ]]; then
+        find "$LATEST" -mindepth 1 -maxdepth 1 -type d \( -name '*_xs_map_*' -o -name '*_access_map_*' \) -printf '%f\n'
+    else
+        find "$LATEST" -mindepth 1 -maxdepth 1 -type d -name "$MATCH" -printf '%f\n'
+    fi | LC_ALL=C sort
+)
+(( ${#CURRENT_MATCHES[@]} <= 1 )) || stop_publish MULTIPLE_CURRENT "kind=$KIND count=${#CURRENT_MATCHES[@]}"
+
+if [[ "$MODE" == preflight ]]; then
+    HISTORY_COLLISION_STATE=none
+    CURRENT_FOLDER=''
+    if (( ${#CURRENT_MATCHES[@]} == 1 )); then
+        CURRENT_FOLDER="${CURRENT_MATCHES[0]}"
+        if [[ -e "$OLD/$CURRENT_FOLDER" ]]; then
+            if dirs_payload_equal "$LATEST/$CURRENT_FOLDER" "$OLD/$CURRENT_FOLDER"; then
+                HISTORY_COLLISION_STATE=identical
+            else
+                HISTORY_COLLISION_STATE=mismatch
+            fi
+        fi
+    fi
+    echo "LABEL=$LABEL"
+    echo "PUBLIC_OBJECT_KIND=$KIND"
+    echo "PUBLIC_MATCH=$MATCH"
+    echo "CURRENT_MATCH_COUNT=${#CURRENT_MATCHES[@]}"
+    echo "CURRENT_FOLDER=$CURRENT_FOLDER"
+    echo "HISTORY_COLLISION_STATE=$HISTORY_COLLISION_STATE"
+    echo PUBLICATION_MUTATION=false
+    if [[ "$HISTORY_COLLISION_STATE" == mismatch ]]; then
+        echo RESULT=STOP_ROUTER_PUBLISH_PREFLIGHT
+        echo STOP_CODE=HISTORY_COLLISION_MISMATCH
+        exit 1
+    fi
+    echo RESULT=PASS_ROUTER_PUBLISH_PREFLIGHT
+    exit 0
+fi
+
+if (( ${#CURRENT_MATCHES[@]} == 1 )) && dirs_payload_equal "$STAGE_DIR" "$LATEST/${CURRENT_MATCHES[0]}"; then
+    PUBLISHED_DIR="$LATEST/${CURRENT_MATCHES[0]}"
+    FOLDER="${CURRENT_MATCHES[0]}"
+    PUBLICATION_REUSED=true
+    rm -rf "$STAGE_DIR"
+else
+    for name in "${CURRENT_MATCHES[@]}"; do
+        [[ -n "$name" ]] || continue
+        if [[ -e "$OLD/$name" ]]; then
+            if dirs_payload_equal "$LATEST/$name" "$OLD/$name"; then
+                backup="$STAGE_ROOT/dedup-$name"
+                mv "$LATEST/$name" "$backup"
+                printf '%s\t%s\n' "$name" "$backup" >> "$DEDUP_LIST"
+            else
+                stop_publish HISTORY_COLLISION_MISMATCH "$name"
+            fi
+        else
+            mv "$LATEST/$name" "$OLD/$name"
+            printf '%s\n' "$name" >> "$MOVED_LIST"
+        fi
+    done
+
+    [[ ! -e "$LATEST/$FOLDER" ]] || stop_publish DESTINATION_EXISTS "$LATEST/$FOLDER"
+    {
+        echo '<!doctype html><html><head><meta charset="utf-8"><title>router report</title></head><body>'
+        printf '<h1>%s %s</h1>\n' "$TS" "$LABEL"
+        echo '<ul>'
+        find "$STAGE_DIR" -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | while IFS= read -r name; do
+            [[ -n "$name" ]] || continue
+            printf '<li><a href="%s">%s</a></li>\n' "$name" "$name"
+        done
+        echo '</ul><p><a href="../">Back to latest</a></p></body></html>'
+    } > "$STAGE_DIR/index.html"
+    chmod 644 "$STAGE_DIR/index.html"
+    mv "$STAGE_DIR" "$LATEST/$FOLDER"
+    PUBLISHED_DIR="$LATEST/$FOLDER"
+    NEW_MOVED=1
+fi
+
+"$REINDEX" >/dev/null || stop_publish REINDEX_FAILED "$REINDEX"
+[[ -d "$PUBLISHED_DIR" ]] || stop_publish PUBLISHED_DIR_MISSING "$PUBLISHED_DIR"
+[[ -f "$LATEST/index.html" ]] || stop_publish LATEST_INDEX_MISSING "$LATEST/index.html"
+grep -Fq "$FOLDER/" "$LATEST/index.html" || stop_publish LATEST_INDEX_FOLDER_MISSING "$FOLDER"
+
+PREVIOUS_MOVED_COUNT="$(awk 'END {print NR + 0}' "$MOVED_LIST")"
+COLLISION_DEDUPLICATED_COUNT="$(awk 'END {print NR + 0}' "$DEDUP_LIST")"
+COMMITTED=1
+trap - EXIT INT TERM HUP
+rm -rf "$STAGE_ROOT"
+
+PUBLISHED_RELATIVE_PATH="latest/$FOLDER"
+PUBLIC_URL="$PUBLIC_BASE/latest/$FOLDER/"
+TRYCF_BASE="${TUNNEL_BASE:-}"
+if [[ -z "$TRYCF_BASE" && -f "$BASE/state/current-quick-tunnel.env" ]]; then
+    TRYCF_BASE="$(awk -F= '$1=="QUICK_TUNNEL_URL" {print substr($0,index($0,"=")+1)}' "$BASE/state/current-quick-tunnel.env" | tail -n 1)"
+fi
+if [[ -z "$TRYCF_BASE" && -f "$PUBLIC/cloudflared-quick.log" ]]; then
+    TRYCF_BASE="$(grep -Eo 'https://[-a-zA-Z0-9.]+\.trycloudflare\.com' "$PUBLIC/cloudflared-quick.log" | tail -n 1 || true)"
+fi
+
+echo "PUBLISHED_DIR=$PUBLISHED_DIR"
+echo "PUBLISHED_RELATIVE_PATH=$PUBLISHED_RELATIVE_PATH"
+echo "PUBLIC_OBJECT_KIND=$KIND"
+echo "PREVIOUS_MOVED_COUNT=$PREVIOUS_MOVED_COUNT"
+echo "COLLISION_DEDUPLICATED_COUNT=$COLLISION_DEDUPLICATED_COUNT"
+echo "PUBLICATION_REUSED=$PUBLICATION_REUSED"
+echo "PUBLICATION_TRANSACTION_ID=$TRANSACTION_ID"
+echo "PUBLICATION_COMMITTED=true"
+echo "LOCAL_POSTCHECK=PASS"
+echo "LATEST_INDEX_CONTAINS_FOLDER=true"
+echo "LOCAL_INDEX=http://192.168.30.84:8099/r/$TOKEN/latest/$FOLDER/"
+echo "LATEST_ROOT_URL=$PUBLIC_BASE/latest/"
+echo "OLD_ROOT_URL=$PUBLIC_BASE/old/"
+echo "PUBLIC_INDEX=$PUBLIC_BASE/latest/"
+echo "PUBLIC_URL=$PUBLIC_URL"
+case "$KIND" in
+  step-report) echo "STEP_REPORT_URL=$PUBLIC_URL" ;;
+  local-m07-plan) echo "LOCAL_M07_PLAN_URL=$PUBLIC_URL" ;;
+  global-project-plan) echo "GLOBAL_PROJECT_PLAN_URL=$PUBLIC_URL" ;;
+  access-map) echo "ACCESS_MAP_URL=$PUBLIC_URL" ;;
+  vm100) echo "VM100_PUBLIC_URL=$PUBLIC_URL" ;;
+  vm101) echo "VM101_PUBLIC_URL=$PUBLIC_URL" ;;
+  vm121) echo "VM121_PUBLIC_URL=$PUBLIC_URL" ;;
+  vm101-model) echo "VM101_MODEL_URL=$PUBLIC_URL" ;;
+  vm101-methods) echo "VM101_METHODS_URL=$PUBLIC_URL" ;;
+  vm130-source) echo "VM130_SOURCE_URL=$PUBLIC_URL" ;;
+  project-source-post) echo "PROJECT_SOURCE_POST_URL=$PUBLIC_URL" ;;
+esac
+if [[ -n "$TRYCF_BASE" ]]; then
+    TRYCF_BASE="${TRYCF_BASE%/}"
+    echo "TRYCF_INDEX=$TRYCF_BASE/r/$TOKEN/latest/"
+    echo "TRYCF_REPORT=$TRYCF_BASE/r/$TOKEN/latest/$FOLDER/"
+fi
+echo RESULT=PASS_ROUTER_PUBLISH_REPORT

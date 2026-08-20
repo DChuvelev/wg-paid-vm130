@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "mgts-main"
+
+PVE = "pve-mgts"
+PVE_KEY = "/root/.ssh/pve_to_openwrt_mgts_ed25519"
+VM101 = "10.71.100.2"
+
+
+def header(title):
+    print()
+    print("################################################################")
+    print(f"### {title}")
+    print("################################################################")
+    print()
+
+
+def vm101(script):
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        PVE,
+        f"ssh -i {PVE_KEY} -o BatchMode=yes -o ConnectTimeout=8 root@{VM101} 'sh -s'",
+    ]
+    p = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    if p.stdout:
+        print(p.stdout, end="")
+    if p.stderr:
+        print(p.stderr, end="", file=sys.stderr)
+    print(f"\nrc={p.returncode}")
+    return p.returncode
+
+
+header("HMN SLOT LOADER INSPECT")
+print(f"INSTANCE={INSTANCE}")
+print("MODE=READ_ONLY")
+print("REMOTE_CHANGES=NO")
+
+header("SLOT LOADER INVENTORY")
+vm101(r'''
+for f in \
+  /root/hmn/hmn-load-vpn-slot.sh \
+  /root/hmn/hmn-load-vpn-test.sh \
+  /root/hmn/hmn-load-vpn-user.sh \
+  /root/hmn/hmn-refill-slot.sh
+do
+  echo "--- $f ---"
+  if [ -f "$f" ]; then
+    ls -l "$f"
+    sha256sum "$f" | sed 's/^/sha256 /'
+  else
+    echo "MISSING"
+  fi
+done
+''')
+
+header("SANITIZED hmn-load-vpn-slot.sh")
+vm101(r'''
+f=/root/hmn/hmn-load-vpn-slot.sh
+echo "### FILE $f"
+if [ -f "$f" ]; then
+  awk '{printf "%5d\t%s\n", NR, $0}' "$f" \
+    | sed -E \
+      -e 's#(PrivateKey|private_key|private-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PRIVATE_KEY]#Ig' \
+      -e 's#(PresharedKey|preshared_key|preshared-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PSK]#Ig' \
+      -e 's#(PublicKey|public_key|public-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PUBLIC_KEY]#Ig' \
+      -e 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g' \
+    | sed -n '1,360p'
+else
+  echo "MISSING"
+fi
+''')
+
+header("LOADER CAPABILITY GREP")
+vm101(r'''
+echo "=== slot restrictions / uci / reload / ifup lines ==="
+grep -RniE 'SLOT|vpn1|vpn2|vpn3|vpn4|vpn5|Usage|uci (set|add|delete|commit)|ifup|ifdown|reload|ubus|amneziawg_|hmn_role|hmn_source|hmn_endpoint|table|route|rule|fwmark' \
+  /root/hmn/hmn-load-vpn-slot.sh 2>/dev/null \
+  | sed -E \
+    -e 's#(PrivateKey|private_key|private-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PRIVATE_KEY]#Ig' \
+    -e 's#(PresharedKey|preshared_key|preshared-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PSK]#Ig' \
+    -e 's#(PublicKey|public_key|public-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PUBLIC_KEY]#Ig' \
+    -e 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g' \
+  | sed -n '1,260p'
+''')
+
+header("MINIMAL DRY PARSE OF FUTURE CANDIDATE CONFIGS, NO KEY VALUES")
+vm101(r'''
+for f in \
+  /root/hmn/configs/awg1/20260601-100614/150-NL-Netherlands-Amsterdam-R5-178.215.227.13-awg1.conf \
+  /root/hmn/configs/awg1/20260601-100614/128-LV-Latvia-Riga-S1-192.121.163.235-awg1.conf \
+  /root/hmn/configs/awg1/20260601-100614/075-NL-Netherlands-Amsterdam-H13-95.211.68.119-awg1.conf \
+  /root/hmn/configs/awg1/20260708-042000/072-NL-Netherlands-Amsterdam-S8-78.31.250.16-awg1.conf \
+  /root/hmn/configs/awg1/20260601-100614/049-DE-Germany-Berlin-S7-157.173.27.69-awg1.conf
+do
+  echo "--- $(basename "$f") ---"
+  if [ -f "$f" ]; then
+    awk '
+      BEGIN {FS="="}
+      /^[[:space:]]*(Address|DNS|Jc|Jmin|Jmax|S1|S2|H1|H2|H3|H4|Endpoint|AllowedIPs|PersistentKeepalive)[[:space:]]*=/ {
+        key=$1
+        val=$0
+        sub(/^[^=]*=[[:space:]]*/, "", val)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+        print key "=" val
+      }
+      /^[[:space:]]*(PrivateKey|PublicKey|PresharedKey)[[:space:]]*=/ {
+        key=$1
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+        print key "=[REDACTED]"
+      }
+    ' "$f"
+  else
+    echo "MISSING"
+  fi
+done
+''')
+
+header("CURRENT SAFE RUNTIME STATE")
+vm101(r'''
+echo "=== interfaces ==="
+ip -br addr
+echo
+echo "=== rules ==="
+ip rule
+echo
+echo "=== tables 200-205 ==="
+for t in 200 201 202 203 204 205; do
+  echo "TABLE $t"
+  ip route show table "$t" 2>/dev/null || true
+done
+echo
+echo "=== firewall vpn_out ==="
+uci show firewall | grep -E 'vpn_out|vpn_in|vpn1|vpn2|vpn3|vpn4|vpn5|vpn_user|vpn_test|forwarding' || true
+''')
+
+header("ASSESSMENT")
+print("No changes applied.")
+print("Decision after this report:")
+print("- if hmn-load-vpn-slot.sh is generic and safe, reuse it for future vpn3-vpn5 load package")
+print("- if it is hard-coded to vpn1/vpn2/table200, write a new minimal generic loader based on hmn-load-vpn-test/user UCI pattern")

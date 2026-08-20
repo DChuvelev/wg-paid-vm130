@@ -1,0 +1,22 @@
+#!/bin/sh
+set -eu
+
+BASE="/opt/router-ops"
+PUBLIC="/opt/router-ops/public"
+PORT="8099"
+PIDFILE="$BASE/public/.http.pid"
+LOG="$BASE/public/http.log"
+
+if [ -s "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; then
+  echo "already running pid=$(cat "$PIDFILE")"
+else
+  nohup python3 -m http.server "$PORT" --bind 0.0.0.0 --directory "$PUBLIC" >"$LOG" 2>&1 &
+  echo $! > "$PIDFILE"
+  sleep 1
+fi
+
+TOKEN="$(cat "$BASE/public/.router-public-token")"
+
+echo "PID=$(cat "$PIDFILE")"
+echo "LOG=$LOG"
+echo "LOCAL_INDEX=http://192.168.30.84:$PORT/r/$TOKEN/"

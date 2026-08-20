@@ -1,0 +1,1997 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as dt
+import fnmatch
+import hashlib
+import io
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import time
+from pathlib import Path, PurePosixPath
+from typing import Any
+
+
+class SyncError(RuntimeError):
+    pass
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+
+    with path.open("rb") as handle:
+        for chunk in iter(
+            lambda: handle.read(1024 * 1024),
+            b"",
+        ):
+            digest.update(chunk)
+
+    return digest.hexdigest()
+
+
+def safe_write_json(
+    path: Path,
+    data: Any,
+    mode: int = 0o600,
+) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    temporary = path.with_name(
+        path.name + f".tmp.{os.getpid()}"
+    )
+
+    temporary.write_text(
+        json.dumps(
+            data,
+            ensure_ascii=False,
+            indent=2,
+        ) + "\n",
+        encoding="utf-8",
+    )
+
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+
+
+def clone_file(
+    source: str,
+    destination: str,
+) -> str:
+    try:
+        os.link(source, destination)
+        return destination
+    except OSError:
+        return shutil.copy2(
+            source,
+            destination,
+        )
+
+
+def clone_tree(
+    source: Path,
+    destination: Path,
+) -> str:
+    if destination.exists():
+        shutil.rmtree(destination)
+
+    try:
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=True,
+            copy_function=clone_file,
+        )
+        return "hardlink_or_copy"
+    except Exception:
+        if destination.exists():
+            shutil.rmtree(destination)
+
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=True,
+            copy_function=shutil.copy2,
+        )
+        return "copy"
+
+
+def remove_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+    elif path.is_dir():
+        shutil.rmtree(path)
+
+
+def local_path(
+    rootfs: Path,
+    absolute_path: str,
+) -> Path:
+    if not absolute_path.startswith("/"):
+        raise SyncError(
+            f"managed path is not absolute: "
+            f"{absolute_path}"
+        )
+
+    relative = absolute_path.lstrip("/")
+
+    resolved = rootfs / relative
+
+    if ".." in PurePosixPath(relative).parts:
+        raise SyncError(
+            f"unsafe managed path: {absolute_path}"
+        )
+
+    return resolved
+
+
+def ssh_command(
+    profile: dict[str, Any],
+    remote_command: str,
+) -> list[str]:
+    ssh = profile["ssh"]
+
+    outer_timeout = int(
+        ssh.get(
+            "outer_connect_timeout_seconds",
+            10,
+        )
+    )
+
+    inner_timeout = int(
+        ssh.get(
+            "inner_connect_timeout_seconds",
+            10,
+        )
+    )
+
+    strict = (
+        "yes"
+        if ssh.get(
+            "strict_host_key_checking",
+            True,
+        )
+        else "no"
+    )
+
+    inner_target = (
+        f"{ssh['inner_user']}@"
+        f"{ssh['inner_host']}"
+    )
+
+    return [
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={outer_timeout}",
+        ssh["outer_alias"],
+
+        "ssh",
+        "-T",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={inner_timeout}",
+        "-o",
+        f"StrictHostKeyChecking={strict}",
+        "-i",
+        ssh["inner_identity_file"],
+        inner_target,
+        remote_command,
+    ]
+
+
+def run_remote(
+    profile: dict[str, Any],
+    remote_command: str,
+    input_data: bytes | None = None,
+    timeout: int = 300,
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        ssh_command(
+            profile,
+            remote_command,
+        ),
+        input=input_data,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def shell_quote(value: str) -> str:
+    return "'" + value.replace(
+        "'",
+        "'\"'\"'",
+    ) + "'"
+
+
+def build_manifest_script(
+    profile: dict[str, Any],
+) -> str:
+    include_roots = list(
+        profile.get("include_roots", [])
+    )
+
+    include_globs = list(
+        profile.get("include_globs", [])
+    )
+
+    exclude_prefixes = [
+        value.rstrip("/")
+        for value in profile.get(
+            "scan_exclude_prefixes",
+            [],
+        )
+    ]
+
+    exclude_globs = list(
+        profile.get(
+            "scan_exclude_globs",
+            [],
+        )
+    )
+
+    literal_pattern = re.compile(
+        r"^/[A-Za-z0-9._/-]+$"
+    )
+
+    glob_pattern = re.compile(
+        r"^[A-Za-z0-9_./*?~#-]+$"
+    )
+
+    for value in include_roots:
+        if not literal_pattern.fullmatch(value):
+            raise SyncError(
+                "unsafe include root: "
+                f"{value}"
+            )
+
+    for value in exclude_prefixes:
+        if not literal_pattern.fullmatch(value):
+            raise SyncError(
+                "unsafe exclude prefix: "
+                f"{value}"
+            )
+
+    for value in include_globs:
+        if (
+            not value.startswith("/")
+            or not glob_pattern.fullmatch(value)
+        ):
+            raise SyncError(
+                "unsafe include glob: "
+                f"{value}"
+            )
+
+    for value in exclude_globs:
+        if not glob_pattern.fullmatch(value):
+            raise SyncError(
+                "unsafe exclude glob: "
+                f"{value}"
+            )
+
+    commands = [
+        "set -u",
+
+        "sanitize_field() {",
+        "  printf '%s' \"$1\" | tr '\\t\\r\\n' '   '",
+        "}",
+
+        "matches_exclude_glob() {",
+        "  probe=\"$1\"",
+        "  case \"$probe\" in",
+    ]
+
+    for pattern in exclude_globs:
+        commands.append(
+            f"    {pattern}) return 0 ;;"
+        )
+
+    commands.extend([
+        "  esac",
+        "  return 1",
+        "}",
+
+        "is_excluded() {",
+        "  candidate=\"$1\"",
+        "  case \"$candidate\" in",
+    ])
+
+    for prefix in exclude_prefixes:
+        commands.append(
+            f"    {prefix}|{prefix}/*) "
+            "return 0 ;;"
+        )
+
+    commands.extend([
+        "  esac",
+
+        "  probe=\"$candidate\"",
+
+        "  while [ -n \"$probe\" ] && "
+        "[ \"$probe\" != \"/\" ]",
+
+        "  do",
+        (
+            "    matches_exclude_glob "
+            "\"$probe\" && return 0"
+        ),
+        "    probe=\"${probe%/*}\"",
+        "    [ -n \"$probe\" ] || probe='/'",
+        "  done",
+
+        "  return 1",
+        "}",
+
+        "emit_path() {",
+        "  path=\"$1\"",
+
+        "  is_excluded \"$path\" && return 0",
+
+        "  if [ -L \"$path\" ]; then",
+        "    type='symlink'",
+        (
+            "    target=\"$(readlink \"$path\" "
+            "2>/dev/null || true)\""
+        ),
+        "    sha='-'",
+        "    size='0'",
+
+        "  elif [ -d \"$path\" ]; then",
+        "    type='directory'",
+        "    target='-'",
+        "    sha='-'",
+        "    size='0'",
+
+        "  elif [ -f \"$path\" ]; then",
+        "    type='file'",
+        "    target='-'",
+        (
+            "    sha=\"$(sha256sum \"$path\" "
+            "2>/dev/null | awk '{print $1}')\""
+        ),
+        (
+            "    size=\"$(stat -c '%s' \"$path\" "
+            "2>/dev/null || printf '0')\""
+        ),
+
+        "  else",
+        "    type='other'",
+        "    target='-'",
+        "    sha='-'",
+        "    size='0'",
+        "  fi",
+
+        (
+            "  mode=\"$(stat -c '%a' \"$path\" "
+            "2>/dev/null || printf '0')\""
+        ),
+        (
+            "  uid=\"$(stat -c '%u' \"$path\" "
+            "2>/dev/null || printf '0')\""
+        ),
+        (
+            "  gid=\"$(stat -c '%g' \"$path\" "
+            "2>/dev/null || printf '0')\""
+        ),
+        (
+            "  mtime=\"$(stat -c '%Y' \"$path\" "
+            "2>/dev/null || printf '0')\""
+        ),
+
+        (
+            "  printf '%s\\t%s\\t%s\\t%s\\t%s"
+            "\\t%s\\t%s\\t%s\\t%s\\n' "
+            "\"$(sanitize_field \"$path\")\" "
+            "\"$type\" \"$mode\" \"$uid\" \"$gid\" "
+            "\"$size\" \"$mtime\" \"$sha\" "
+            "\"$(sanitize_field \"$target\")\""
+        ),
+        "}",
+
+        "scan_path() {",
+        "  root=\"$1\"",
+
+        "  is_excluded \"$root\" && return 0",
+
+        (
+            "  [ -e \"$root\" ] || "
+            "[ -L \"$root\" ] || return 0"
+        ),
+
+        (
+            "  if [ -d \"$root\" ] && "
+            "[ ! -L \"$root\" ]; then"
+        ),
+
+        "    find \"$root\" -xdev -print 2>/dev/null |",
+
+        "    while IFS= read -r path",
+        "    do",
+        "      emit_path \"$path\"",
+        "    done",
+
+        "  else",
+        "    emit_path \"$root\"",
+        "  fi",
+        "}",
+
+        (
+            "printf 'path\\ttype\\tmode\\tuid\\tgid"
+            "\\tsize\\tmtime\\tsha256\\ttarget\\n'"
+        ),
+    ])
+
+    for root in include_roots:
+        commands.append(
+            "scan_path "
+            + shell_quote(root)
+        )
+
+    for pattern in include_globs:
+        commands.extend([
+            f"for root in {pattern}",
+            "do",
+            (
+                "  [ -e \"$root\" ] || "
+                "[ -L \"$root\" ] || continue"
+            ),
+            "  scan_path \"$root\"",
+            "done",
+        ])
+
+    return "\n".join(commands) + "\n"
+
+
+def parse_manifest(
+    raw: bytes,
+) -> dict[str, dict[str, Any]]:
+    text = raw.decode(
+        "utf-8",
+        errors="strict",
+    )
+
+    reader = csv.DictReader(
+        io.StringIO(text),
+        delimiter="\t",
+    )
+
+    result: dict[str, dict[str, Any]] = {}
+
+    expected = {
+        "path",
+        "type",
+        "mode",
+        "uid",
+        "gid",
+        "size",
+        "mtime",
+        "sha256",
+        "target",
+    }
+
+    if set(reader.fieldnames or []) != expected:
+        raise SyncError(
+            "remote manifest header mismatch: "
+            f"{reader.fieldnames}"
+        )
+
+    for row in reader:
+        path = row["path"]
+
+        if not path.startswith("/"):
+            raise SyncError(
+                f"non-absolute path in manifest: {path}"
+            )
+
+        if "\t" in path or "\n" in path:
+            raise SyncError(
+                f"unsupported path characters: {path!r}"
+            )
+
+        result[path] = {
+            "path": path,
+            "type": row["type"],
+            "mode": row["mode"],
+            "uid": int(row["uid"] or 0),
+            "gid": int(row["gid"] or 0),
+            "size": int(row["size"] or 0),
+            "mtime": int(row["mtime"] or 0),
+            "sha256": row["sha256"],
+            "target": row["target"],
+        }
+
+    return dict(sorted(result.items()))
+
+
+def record_identity(
+    record: dict[str, Any],
+) -> tuple[Any, ...]:
+    return (
+        record["type"],
+        record["mode"],
+        record["sha256"],
+        record["target"],
+    )
+
+
+def read_previous_state(
+    current_state: Path,
+) -> dict[str, Any] | None:
+    if not current_state.is_file():
+        return None
+
+    return json.loads(
+        current_state.read_text(
+            encoding="utf-8",
+        )
+    )
+
+
+def read_previous_manifest(
+    previous_state: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    if not previous_state:
+        return {}
+
+    manifest_path = Path(
+        previous_state["private_manifest"]
+    )
+
+    if not manifest_path.is_file():
+        return {}
+
+    data = json.loads(
+        manifest_path.read_text(
+            encoding="utf-8",
+        )
+    )
+
+    return {
+        item["path"]: item
+        for item in data["entries"]
+    }
+
+
+def download_changed_paths(
+    profile: dict[str, Any],
+    changed_paths: list[str],
+    rootfs: Path,
+) -> int:
+    transferable = [
+        path.lstrip("/")
+        for path in changed_paths
+    ]
+
+    if not transferable:
+        return 0
+
+    script_lines = [
+        "set -eu",
+        "set --",
+    ]
+
+    for relative in transferable:
+        archive_path = "./" + relative
+
+        script_lines.append(
+            'set -- "$@" '
+            + shell_quote(archive_path)
+        )
+
+    script_lines.append(
+        'exec tar -C / -cf - "$@"'
+    )
+
+    remote_script = (
+        "\n".join(script_lines) + "\n"
+    ).encode("utf-8")
+
+    process = run_remote(
+        profile,
+        "sh -s",
+        input_data=remote_script,
+        timeout=600,
+    )
+
+    if process.returncode != 0:
+        raise SyncError(
+            "remote tar failed: "
+            + process.stderr.decode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+    archive_bytes = process.stdout
+
+    with tarfile.open(
+        fileobj=io.BytesIO(archive_bytes),
+        mode="r:",
+    ) as archive:
+        members = archive.getmembers()
+
+        for member in members:
+            pure = PurePosixPath(member.name)
+
+            if pure.is_absolute():
+                raise SyncError(
+                    f"absolute archive member: "
+                    f"{member.name}"
+                )
+
+            if ".." in pure.parts:
+                raise SyncError(
+                    f"unsafe archive member: "
+                    f"{member.name}"
+                )
+
+        for member in members:
+            pure = PurePosixPath(member.name)
+
+            relative_parts = [
+                part
+                for part in pure.parts
+                if part not in {"", "."}
+            ]
+
+            if not relative_parts:
+                continue
+
+            destination = rootfs.joinpath(
+                *relative_parts
+            )
+
+            parent = destination.parent
+
+            while parent != rootfs:
+                if parent.is_symlink():
+                    raise SyncError(
+                        "archive parent is a symlink: "
+                        f"{parent}"
+                    )
+
+                parent = parent.parent
+
+            destination.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            if member.isdir():
+                if (
+                    destination.exists()
+                    and not destination.is_dir()
+                ) or destination.is_symlink():
+                    remove_path(destination)
+
+                destination.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+            elif member.isfile() or member.islnk():
+                if (
+                    destination.exists()
+                    or destination.is_symlink()
+                ):
+                    remove_path(destination)
+
+                source_handle = archive.extractfile(
+                    member
+                )
+
+                if source_handle is None:
+                    raise SyncError(
+                        "archive file has no payload: "
+                        f"{member.name}"
+                    )
+
+                temporary = destination.with_name(
+                    destination.name
+                    + f".tmp.{os.getpid()}"
+                )
+
+                with source_handle:
+                    with temporary.open("wb") as output:
+                        shutil.copyfileobj(
+                            source_handle,
+                            output,
+                        )
+
+                os.replace(
+                    temporary,
+                    destination,
+                )
+
+            elif member.issym():
+                if (
+                    destination.exists()
+                    or destination.is_symlink()
+                ):
+                    remove_path(destination)
+
+                os.symlink(
+                    member.linkname,
+                    destination,
+                )
+
+            else:
+                raise SyncError(
+                    "unsupported archive member type: "
+                    f"{member.name}"
+                )
+
+    return len(archive_bytes)
+
+
+def apply_manifest_modes(
+    rootfs: Path,
+    manifest: dict[str, dict[str, Any]],
+) -> None:
+    """
+    Materialize managed directories without applying restrictive live
+    ownership or modes to the local model.
+
+    Exact live mode, uid and gid values remain authoritative in
+    manifest.json. The local private snapshot is an operator-readable
+    representation used for comparison and publication.
+    """
+
+    directories = [
+        record
+        for record in manifest.values()
+        if record["type"] == "directory"
+    ]
+
+    directories.sort(
+        key=lambda item: item["path"].count("/"),
+    )
+
+    for record in directories:
+        path = local_path(
+            rootfs,
+            record["path"],
+        )
+
+        path.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+
+def local_manifest(
+    rootfs: Path,
+) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+
+    if not rootfs.exists():
+        return result
+
+    for path in sorted(
+        rootfs.rglob("*"),
+        key=lambda item: item.as_posix(),
+    ):
+        relative = path.relative_to(rootfs)
+        absolute = "/" + relative.as_posix()
+
+        info = os.lstat(path)
+
+        if stat.S_ISLNK(info.st_mode):
+            kind = "symlink"
+            target = os.readlink(path)
+            digest = "-"
+            size = 0
+        elif stat.S_ISDIR(info.st_mode):
+            kind = "directory"
+            target = "-"
+            digest = "-"
+            size = 0
+        elif stat.S_ISREG(info.st_mode):
+            kind = "file"
+            target = "-"
+            digest = sha256_file(path)
+            size = info.st_size
+        else:
+            kind = "other"
+            target = "-"
+            digest = "-"
+            size = 0
+
+        result[absolute] = {
+            "path": absolute,
+            "type": kind,
+            "mode": format(
+                stat.S_IMODE(info.st_mode),
+                "o",
+            ),
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "size": size,
+            "mtime": int(info.st_mtime),
+            "sha256": digest,
+            "target": target,
+        }
+
+    return result
+
+
+def snapshot_content_identity(
+    record: dict[str, Any],
+) -> tuple[Any, ...]:
+    """
+    Identity used to verify materialized model contents.
+
+    Live mode, uid and gid are verified by the remote manifest itself
+    and retained in manifest.json. They are deliberately not imposed on
+    the router-ops storage tree.
+    """
+
+    return (
+        record["type"],
+        record["sha256"],
+        record["target"],
+    )
+
+
+def verify_exact_snapshot(
+    rootfs: Path,
+    remote_manifest: dict[str, dict[str, Any]],
+) -> None:
+    local = local_manifest(rootfs)
+
+    remote_paths = set(remote_manifest)
+    local_paths = set(local)
+
+    structural_parents: set[str] = set()
+
+    for absolute in remote_paths:
+        parent = PurePosixPath(absolute).parent
+
+        while str(parent) not in {"", ".", "/"}:
+            structural_parents.add(
+                str(parent)
+            )
+            parent = parent.parent
+
+    ignored_structural = {
+        path
+        for path in local_paths - remote_paths
+        if (
+            path in structural_parents
+            and local[path]["type"] == "directory"
+        )
+    }
+
+    effective_local_paths = (
+        local_paths - ignored_structural
+    )
+
+    if remote_paths != effective_local_paths:
+        missing = sorted(
+            remote_paths - effective_local_paths
+        )
+
+        extra = sorted(
+            effective_local_paths - remote_paths
+        )
+
+        raise SyncError(
+            "snapshot path mismatch: "
+            f"missing={missing[:20]} "
+            f"extra={extra[:20]} "
+            f"ignored_structural="
+            f"{sorted(ignored_structural)[:20]}"
+        )
+
+    failures: list[str] = []
+
+    for path, remote in remote_manifest.items():
+        local_record = local[path]
+
+        if snapshot_content_identity(
+            remote
+        ) != snapshot_content_identity(
+            local_record
+        ):
+            failures.append(path)
+
+    if failures:
+        raise SyncError(
+            "snapshot content mismatch: "
+            + ",".join(failures[:20])
+        )
+
+
+def path_matches_globs(
+    path: str,
+    patterns: list[str],
+) -> bool:
+    relative = path.lstrip("/")
+
+    basename = PurePosixPath(path).name
+
+    for pattern in patterns:
+        if (
+            fnmatch.fnmatch(path, pattern)
+            or fnmatch.fnmatch(relative, pattern)
+            or fnmatch.fnmatch(basename, pattern)
+        ):
+            return True
+
+    return False
+
+
+def is_binary(path: Path) -> bool:
+    if not path.is_file():
+        return False
+
+    with path.open("rb") as handle:
+        sample = handle.read(8192)
+
+    return b"\x00" in sample
+
+
+def redact_text(
+    text: str,
+    sensitive_regex: re.Pattern[str],
+) -> tuple[str, int]:
+    result: list[str] = []
+    redactions = 0
+
+    shell_assignment = re.compile(
+        r"^(\s*(?:export\s+)?"
+        r"[A-Za-z0-9_.-]+"
+        r"\s*=\s*).*$"
+    )
+
+    uci_option = re.compile(
+        r"^(\s*option\s+"
+        r"[A-Za-z0-9_.-]+"
+        r"\s+).*$"
+    )
+
+    mapping_value = re.compile(
+        r"^(\s*[\"']?"
+        r"[A-Za-z0-9_.-]+"
+        r"[\"']?\s*:\s*).*$"
+    )
+
+    for line in text.splitlines(
+        keepends=True,
+    ):
+        stripped_newline = line.rstrip(
+            "\r\n"
+        )
+
+        newline = line[
+            len(stripped_newline):
+        ]
+
+        if sensitive_regex.search(
+            stripped_newline
+        ):
+            match = (
+                shell_assignment.match(
+                    stripped_newline
+                )
+                or uci_option.match(
+                    stripped_newline
+                )
+                or mapping_value.match(
+                    stripped_newline
+                )
+            )
+
+            if match:
+                result.append(
+                    match.group(1)
+                    + "\"<REDACTED>\""
+                    + newline
+                )
+                redactions += 1
+                continue
+
+        result.append(line)
+
+    return "".join(result), redactions
+
+
+def create_public_snapshot(
+    exact_rootfs: Path,
+    public_rootfs: Path,
+    remote_manifest: dict[str, dict[str, Any]],
+    profile: dict[str, Any],
+) -> dict[str, Any]:
+    if public_rootfs.exists():
+        shutil.rmtree(public_rootfs)
+
+    shutil.copytree(
+        exact_rootfs,
+        public_rootfs,
+        symlinks=True,
+        copy_function=shutil.copy2,
+    )
+
+    exclude_globs = profile.get(
+        "public_exclude_globs",
+        [],
+    )
+
+    sanitize_prefixes = [
+        prefix.rstrip("/")
+        for prefix in profile.get(
+            "public_sanitize_prefixes",
+            [],
+        )
+    ]
+
+    sanitize_all = bool(
+        profile.get(
+            "public_sanitize_all_text_assignments",
+            False,
+        )
+    )
+
+    binary_policy = profile.get(
+        "public_binary_policy",
+        "keep",
+    )
+
+    sensitive_regex = re.compile(
+        profile["sensitive_key_regex"]
+    )
+
+    publication: list[dict[str, Any]] = []
+
+    for absolute in sorted(
+        remote_manifest,
+        key=lambda value: (
+            value.count("/"),
+            value,
+        ),
+        reverse=True,
+    ):
+        record = remote_manifest[absolute]
+        target = local_path(
+            public_rootfs,
+            absolute,
+        )
+
+        if path_matches_globs(
+            absolute,
+            exclude_globs,
+        ):
+            if target.exists() or target.is_symlink():
+                remove_path(target)
+
+            publication.append({
+                "path": absolute,
+                "status": "excluded",
+                "reason":
+                    "public_exclude_glob",
+            })
+            continue
+
+        if record["type"] != "file":
+            publication.append({
+                "path": absolute,
+                "status": "published",
+                "reason": None,
+            })
+            continue
+
+        if not target.is_file():
+            publication.append({
+                "path": absolute,
+                "status": "excluded_by_parent",
+                "reason":
+                    "parent_path_excluded",
+            })
+            continue
+
+        if (
+            binary_policy == "metadata_only"
+            and is_binary(target)
+        ):
+            target.unlink()
+
+            publication.append({
+                "path": absolute,
+                "status": "metadata_only",
+                "reason":
+                    "binary_file_not_publicly_copied",
+            })
+            continue
+
+        should_sanitize = sanitize_all or any(
+            absolute == prefix
+            or absolute.startswith(
+                prefix + "/"
+            )
+            for prefix in sanitize_prefixes
+        )
+
+        redaction_count = 0
+
+        if should_sanitize:
+            try:
+                text = target.read_text(
+                    encoding="utf-8",
+                    errors="strict",
+                )
+            except UnicodeDecodeError:
+                text = ""
+
+            if text:
+                sanitized, redaction_count = redact_text(
+                    text,
+                    sensitive_regex,
+                )
+
+                if redaction_count:
+                    target.write_text(
+                        sanitized,
+                        encoding="utf-8",
+                    )
+
+        publication.append({
+            "path": absolute,
+            "status": (
+                "redacted"
+                if redaction_count
+                else "published"
+            ),
+            "reason": (
+                f"redacted_assignment_lines="
+                f"{redaction_count}"
+                if redaction_count
+                else None
+            ),
+        })
+
+    return {
+        "schema":
+            "router-machine-model-publication-map-v1",
+        "entries":
+            sorted(
+                publication,
+                key=lambda item: item["path"],
+            ),
+        "summary": {
+            "published":
+                sum(
+                    1
+                    for item in publication
+                    if item["status"] == "published"
+                ),
+            "redacted":
+                sum(
+                    1
+                    for item in publication
+                    if item["status"] == "redacted"
+                ),
+            "excluded":
+                sum(
+                    1
+                    for item in publication
+                    if item["status"].startswith(
+                        "excluded"
+                    )
+                ),
+            "metadata_only":
+                sum(
+                    1
+                    for item in publication
+                    if item["status"] == "metadata_only"
+                ),
+        },
+    }
+
+
+def create_tree_file(
+    rootfs: Path,
+    destination: Path,
+) -> None:
+    lines = [
+        "PUBLISHED MACHINE MODEL",
+        "",
+        "rootfs/",
+    ]
+
+    entries = sorted(
+        rootfs.rglob("*"),
+        key=lambda path: path.as_posix(),
+    )
+
+    for path in entries:
+        relative = path.relative_to(rootfs)
+        depth = len(relative.parts)
+        name = relative.name
+
+        if path.is_dir() and not path.is_symlink():
+            name += "/"
+        elif path.is_symlink():
+            name += f" -> {os.readlink(path)}"
+
+        lines.append(
+            "  " * depth + name
+        )
+
+    destination.write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+
+def create_public_index(
+    public_snapshot: Path,
+    model_id: str,
+) -> None:
+    (public_snapshot / "index.html").write_text(
+        f"""<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>{model_id}</title>
+</head>
+<body style="font-family:system-ui;max-width:1100px;margin:40px auto">
+<h1>VM101 machine model</h1>
+<p>Snapshot: <code>{model_id}</code></p>
+<p>
+After <code>rootfs/</code>, paths exactly match absolute paths on VM101.
+</p>
+<ul>
+<li><a href="rootfs/">Browse rootfs</a></li>
+<li><a href="tree.txt">Tree</a></li>
+<li><a href="manifest.json">Exact managed manifest</a></li>
+<li><a href="publication-map.json">Public redaction and exclusion map</a></li>
+<li><a href="sync-result.json">Sync result</a></li>
+<li><a href="profile.json">Machine profile</a></li>
+<li><a href="SHA256SUMS">SHA256SUMS</a></li>
+</ul>
+</body>
+</html>
+""",
+        encoding="utf-8",
+    )
+
+
+def sha256_tree(
+    root: Path,
+) -> None:
+    checksum_path = root / "SHA256SUMS"
+
+    lines: list[str] = []
+
+    for path in sorted(
+        root.rglob("*"),
+        key=lambda item: item.as_posix(),
+    ):
+        if path.is_symlink():
+            continue
+
+        if not path.is_file() or path == checksum_path:
+            continue
+
+        relative = path.relative_to(root)
+
+        lines.append(
+            f"{sha256_file(path)}  "
+            f"{relative.as_posix()}"
+        )
+
+    checksum_path.write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+
+
+def validate_required_paths(
+    rootfs: Path,
+    profile: dict[str, Any],
+) -> None:
+    required = profile.get(
+        "validation",
+        {},
+    ).get(
+        "required_paths",
+        [],
+    )
+
+    missing = [
+        path
+        for path in required
+        if not local_path(
+            rootfs,
+            path,
+        ).is_file()
+    ]
+
+    if missing:
+        raise SyncError(
+            "required managed files missing: "
+            + ",".join(missing)
+        )
+
+
+def validate_shell_syntax(
+    rootfs: Path,
+    profile: dict[str, Any],
+) -> list[dict[str, Any]]:
+    paths = profile.get(
+        "validation",
+        {},
+    ).get(
+        "required_shell_syntax_paths",
+        [],
+    )
+
+    results: list[dict[str, Any]] = []
+
+    for absolute in paths:
+        path = local_path(
+            rootfs,
+            absolute,
+        )
+
+        process = subprocess.run(
+            ["sh", "-n", str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+
+        results.append({
+            "path": absolute,
+            "rc": process.returncode,
+            "stderr": process.stderr.decode(
+                "utf-8",
+                errors="replace",
+            ),
+        })
+
+    failures = [
+        item
+        for item in results
+        if item["rc"] != 0
+    ]
+
+    if failures:
+        raise SyncError(
+            "shell syntax validation failed: "
+            + ",".join(
+                item["path"]
+                for item in failures
+            )
+        )
+
+    return results
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--config",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--state-root",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--public-root",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--public-base",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--timestamp",
+        required=True,
+    )
+
+    parser.add_argument(
+        "--result",
+        required=True,
+    )
+
+    args = parser.parse_args()
+
+    started = time.monotonic()
+
+    profile_path = Path(args.config)
+    state_root = Path(args.state_root)
+    public_root = Path(args.public_root)
+    result_path = Path(args.result)
+
+    profile = json.loads(
+        profile_path.read_text(
+            encoding="utf-8",
+        )
+    )
+
+    machine_id = profile["machine_id"]
+    timestamp = args.timestamp
+
+    model_id = (
+        f"{timestamp}_{machine_id}_model_rootfs_v1"
+    )
+
+    machine_state = (
+        state_root
+        / "machine-models"
+        / machine_id
+    )
+
+    snapshot_root = (
+        machine_state
+        / "snapshots"
+        / model_id
+    )
+
+    private_rootfs = (
+        snapshot_root
+        / "rootfs"
+    )
+
+    public_snapshot = (
+        public_root
+        / model_id
+    )
+
+    public_rootfs = (
+        public_snapshot
+        / "rootfs"
+    )
+
+    current_state_path = (
+        machine_state
+        / "current.json"
+    )
+
+    previous_state = read_previous_state(
+        current_state_path
+    )
+
+    previous_manifest = read_previous_manifest(
+        previous_state
+    )
+
+    previous_rootfs: Path | None = None
+
+    if previous_state:
+        candidate = Path(
+            previous_state["private_rootfs"]
+        )
+
+        if candidate.is_dir():
+            previous_rootfs = candidate
+
+    manifest_started = time.monotonic()
+
+    manifest_process = run_remote(
+        profile,
+        "sh -s",
+        input_data=build_manifest_script(
+            profile
+        ).encode("utf-8"),
+        timeout=600,
+    )
+
+    manifest_seconds = (
+        time.monotonic() - manifest_started
+    )
+
+    if manifest_process.returncode != 0:
+        raise SyncError(
+            "remote manifest scan failed: "
+            + manifest_process.stderr.decode(
+                "utf-8",
+                errors="replace",
+            )
+        )
+
+    remote_manifest = parse_manifest(
+        manifest_process.stdout
+    )
+
+    if not remote_manifest:
+        raise SyncError(
+            "remote managed manifest is empty"
+        )
+
+    added = sorted(
+        set(remote_manifest)
+        - set(previous_manifest)
+    )
+
+    removed = sorted(
+        set(previous_manifest)
+        - set(remote_manifest)
+    )
+
+    changed = sorted(
+        path
+        for path in (
+            set(remote_manifest)
+            & set(previous_manifest)
+        )
+        if record_identity(
+            remote_manifest[path]
+        )
+        != record_identity(
+            previous_manifest[path]
+        )
+    )
+
+    if snapshot_root.exists():
+        shutil.rmtree(snapshot_root)
+
+    snapshot_root.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    if previous_rootfs:
+        clone_method = clone_tree(
+            previous_rootfs,
+            private_rootfs,
+        )
+        sync_mode = "delta"
+    else:
+        private_rootfs.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+        clone_method = "initial_empty"
+        sync_mode = "initial"
+
+    for absolute in sorted(
+        set(removed) | set(changed),
+        key=lambda value: (
+            value.count("/"),
+            value,
+        ),
+        reverse=True,
+    ):
+        path = local_path(
+            private_rootfs,
+            absolute,
+        )
+
+        if path.exists() or path.is_symlink():
+            remove_path(path)
+
+    transferable = sorted(
+        path
+        for path in set(added) | set(changed)
+        if remote_manifest[path]["type"]
+        in {"file", "symlink"}
+    )
+
+    downloaded_bytes = download_changed_paths(
+        profile,
+        transferable,
+        private_rootfs,
+    )
+
+    apply_manifest_modes(
+        private_rootfs,
+        remote_manifest,
+    )
+
+    verify_exact_snapshot(
+        private_rootfs,
+        remote_manifest,
+    )
+
+    validate_required_paths(
+        private_rootfs,
+        profile,
+    )
+
+    shell_validation = validate_shell_syntax(
+        private_rootfs,
+        profile,
+    )
+
+    manifest_document = {
+        "schema":
+            "router-machine-model-manifest-v1",
+
+        "machine_id":
+            machine_id,
+
+        "model_id":
+            model_id,
+
+        "generated_at_utc":
+            timestamp,
+
+        "rootfs_prefix":
+            "rootfs",
+
+        "entries":
+            list(remote_manifest.values()),
+    }
+
+    safe_write_json(
+        snapshot_root / "manifest.json",
+        manifest_document,
+    )
+
+    shutil.copy2(
+        profile_path,
+        snapshot_root / "profile.json",
+    )
+
+    if public_snapshot.exists():
+        shutil.rmtree(public_snapshot)
+
+    public_snapshot.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    publication_map = create_public_snapshot(
+        private_rootfs,
+        public_rootfs,
+        remote_manifest,
+        profile,
+    )
+
+    public_manifest = public_snapshot / "manifest.json"
+
+    safe_write_json(
+        public_manifest,
+        manifest_document,
+        mode=0o644,
+    )
+
+    safe_write_json(
+        public_snapshot / "publication-map.json",
+        publication_map,
+        mode=0o644,
+    )
+
+    shutil.copy2(
+        profile_path,
+        public_snapshot / "profile.json",
+    )
+
+    os.chmod(
+        public_snapshot / "profile.json",
+        0o644,
+    )
+
+    create_tree_file(
+        public_rootfs,
+        public_snapshot / "tree.txt",
+    )
+
+    create_public_index(
+        public_snapshot,
+        model_id,
+    )
+
+    total_seconds = (
+        time.monotonic() - started
+    )
+
+    public_url = (
+        args.public_base.rstrip("/")
+        + "/"
+        + model_id
+        + "/"
+    )
+
+    result = {
+        "schema":
+            "router-machine-model-sync-result-v1",
+
+        "machine_id":
+            machine_id,
+
+        "model_id":
+            model_id,
+
+        "generated_at_utc":
+            timestamp,
+
+        "sync_mode":
+            sync_mode,
+
+        "clone_method":
+            clone_method,
+
+        "previous_model_id": (
+            previous_state.get("model_id")
+            if previous_state
+            else None
+        ),
+
+        "private_snapshot":
+            str(snapshot_root),
+
+        "private_rootfs":
+            str(private_rootfs),
+
+        "private_manifest":
+            str(
+                snapshot_root
+                / "manifest.json"
+            ),
+
+        "public_snapshot":
+            str(public_snapshot),
+
+        "public_rootfs":
+            str(public_rootfs),
+
+        "public_url":
+            public_url,
+
+        "manifest": {
+            "entry_count":
+                len(remote_manifest),
+            "added_count":
+                len(added),
+            "changed_count":
+                len(changed),
+            "removed_count":
+                len(removed),
+        },
+
+        "transfer": {
+            "downloaded_path_count":
+                len(transferable),
+            "downloaded_archive_bytes":
+                downloaded_bytes,
+        },
+
+        "timing": {
+            "remote_manifest_seconds":
+                round(manifest_seconds, 3),
+            "total_seconds":
+                round(total_seconds, 3),
+        },
+
+        "changes": {
+            "added": added,
+            "changed": changed,
+            "removed": removed,
+        },
+
+        "shell_syntax_validation":
+            shell_validation,
+
+        "publication":
+            publication_map["summary"],
+
+        "safety": {
+            "remote_access":
+                "read_only",
+            "vm101_modified":
+                False,
+        },
+    }
+
+    safe_write_json(
+        snapshot_root / "sync-result.json",
+        result,
+    )
+
+    safe_write_json(
+        public_snapshot / "sync-result.json",
+        result,
+        mode=0o644,
+    )
+
+    sha256_tree(public_snapshot)
+
+    current_state = {
+        "schema":
+            "router-machine-model-current-v1",
+        "machine_id":
+            machine_id,
+        "model_id":
+            model_id,
+        "private_snapshot":
+            str(snapshot_root),
+        "private_rootfs":
+            str(private_rootfs),
+        "private_manifest":
+            str(
+                snapshot_root
+                / "manifest.json"
+            ),
+        "public_snapshot":
+            str(public_snapshot),
+        "public_url":
+            public_url,
+        "generated_at_utc":
+            timestamp,
+    }
+
+    safe_write_json(
+        current_state_path,
+        current_state,
+    )
+
+    current_private_link = (
+        machine_state
+        / "current"
+    )
+
+    if (
+        current_private_link.exists()
+        and not current_private_link.is_symlink()
+    ):
+        raise SyncError(
+            "private current path exists "
+            "and is not a symlink"
+        )
+
+    current_private_link.unlink(
+        missing_ok=True,
+    )
+
+    current_private_link.symlink_to(
+        Path("snapshots") / model_id
+    )
+
+    public_current_parent = (
+        public_root
+        / f"{machine_id}-model"
+    )
+
+    public_current_parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    public_current = (
+        public_current_parent
+        / "current"
+    )
+
+    if (
+        public_current.exists()
+        and not public_current.is_symlink()
+    ):
+        raise SyncError(
+            "public current path exists "
+            "and is not a symlink"
+        )
+
+    public_current.unlink(
+        missing_ok=True,
+    )
+
+    public_current.symlink_to(
+        Path("..") / model_id
+    )
+
+    env_path = (
+        state_root
+        / f"current-{machine_id}-model.env"
+    )
+
+    env_path.write_text(
+        "\n".join([
+            f"VM101_MODEL_ID={model_id}",
+            f"VM101_MODEL_PRIVATE={snapshot_root}",
+            f"VM101_MODEL_PRIVATE_ROOTFS={private_rootfs}",
+            f"VM101_MODEL_PUBLIC={public_snapshot}",
+            f"VM101_MODEL_PUBLIC_ROOTFS={public_rootfs}",
+            f"VM101_MODEL_URL={public_url}",
+            "VM101_MODEL_ROOTFS_PREFIX=rootfs",
+            f"VM101_MODEL_SYNC_MODE={sync_mode}",
+            (
+                "VM101_MODEL_MANIFEST_ENTRY_COUNT="
+                f"{len(remote_manifest)}"
+            ),
+            (
+                "VM101_MODEL_ADDED_COUNT="
+                f"{len(added)}"
+            ),
+            (
+                "VM101_MODEL_CHANGED_COUNT="
+                f"{len(changed)}"
+            ),
+            (
+                "VM101_MODEL_REMOVED_COUNT="
+                f"{len(removed)}"
+            ),
+            (
+                "VM101_MODEL_GENERATED_AT_UTC="
+                f"{timestamp}"
+            ),
+        ]) + "\n",
+        encoding="utf-8",
+    )
+
+    os.chmod(
+        env_path,
+        0o600,
+    )
+
+    safe_write_json(
+        result_path,
+        result,
+    )
+
+    print(
+        f"MODEL_ID={model_id}"
+    )
+    print(
+        f"MODEL_URL={public_url}"
+    )
+    print(
+        f"SYNC_MODE={sync_mode}"
+    )
+    print(
+        "MANIFEST_ENTRY_COUNT="
+        f"{len(remote_manifest)}"
+    )
+    print(
+        f"ADDED_COUNT={len(added)}"
+    )
+    print(
+        f"CHANGED_COUNT={len(changed)}"
+    )
+    print(
+        f"REMOVED_COUNT={len(removed)}"
+    )
+    print(
+        "DOWNLOADED_COUNT="
+        f"{len(transferable)}"
+    )
+    print(
+        "DOWNLOADED_BYTES="
+        f"{downloaded_bytes}"
+    )
+    print(
+        "SCAN_SECONDS="
+        f"{manifest_seconds:.3f}"
+    )
+    print(
+        "TOTAL_SECONDS="
+        f"{total_seconds:.3f}"
+    )
+
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except Exception as error:
+        print(
+            f"SYNC_ERROR={type(error).__name__}:"
+            f"{error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)

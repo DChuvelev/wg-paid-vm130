@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import json
+import re
+import sys
+
+txt = sys.stdin.read()
+packets = 0
+bytes_ = 0
+seen = set()
+
+for pat in [
+    re.compile(r"\bpackets\s+(\d+)\s+bytes\s+(\d+)\b", re.I),
+    re.compile(r"\b(\d+)\s+packets?\s+(\d+)\s+bytes?\b", re.I),
+]:
+    for m in pat.finditer(txt):
+        p = int(m.group(1))
+        b = int(m.group(2))
+        key = (p, b, m.group(0))
+        if key in seen:
+            continue
+        seen.add(key)
+        packets += p
+        bytes_ += b
+
+print(json.dumps({
+    "packets": packets,
+    "bytes": bytes_,
+    "matched_counter_count": len(seen),
+    "raw_nonempty": bool(txt.strip()),
+}, sort_keys=True))

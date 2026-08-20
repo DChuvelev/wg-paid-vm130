@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUNS="${ROUTER_OPS_RUNS:-/opt/router-ops/runs}"
+
+last="$(find "$RUNS" -mindepth 2 -maxdepth 2 -name report.md -printf '%T@ %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)"
+
+if [ -z "${last:-}" ]; then
+  echo "No reports found in $RUNS" >&2
+  exit 1
+fi
+
+cat "$last"

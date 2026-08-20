@@ -1,0 +1,58 @@
+#!/bin/sh
+set -eu
+
+BASE="/opt/router-ops"
+TOKEN_FILE="$BASE/public/.router-public-token"
+
+if [ $# -lt 1 ]; then
+  echo "Usage: router-publish-file <file> [public-name]" >&2
+  exit 1
+fi
+
+SRC="$1"
+NAME="${2:-$(basename "$SRC")}"
+
+if [ ! -f "$SRC" ]; then
+  echo "ERROR: file not found: $SRC" >&2
+  exit 1
+fi
+
+TOKEN="$(cat "$TOKEN_FILE")"
+PUBDIR="$BASE/public/r/$TOKEN"
+mkdir -p "$PUBDIR"
+
+case "$SRC" in
+  *raw*|*.env|*secrets*|*private*|*Private*|*id_rsa*|*id_ed25519*)
+    echo "REFUSE: suspicious source path, not publishing: $SRC" >&2
+    exit 2
+    ;;
+esac
+
+case "$NAME" in
+  *raw*|*.env|*secrets*|*private*|*Private*|*id_rsa*|*id_ed25519*)
+    echo "REFUSE: suspicious public name: $NAME" >&2
+    exit 2
+    ;;
+esac
+
+cp -a "$SRC" "$PUBDIR/$NAME"
+chmod 644 "$PUBDIR/$NAME"
+
+{
+  echo "<!doctype html><html><head><meta charset=\"utf-8\"><title>router-ops reports</title></head><body>"
+  echo "<h1>router-ops reports</h1>"
+  echo "<p>Sanitized published files only.</p>"
+  echo "<ul>"
+  for f in "$PUBDIR"/*; do
+    [ -f "$f" ] || continue
+    b="$(basename "$f")"
+    [ "$b" = "index.html" ] && continue
+    echo "<li><a href=\"$b\">$b</a></li>"
+  done | sort
+  echo "</ul>"
+  echo "</body></html>"
+} > "$PUBDIR/index.html"
+
+echo "PUBLISHED=$PUBDIR/$NAME"
+echo "LOCAL_URL=http://192.168.30.84:8099/r/$TOKEN/$NAME"
+echo "LOCAL_INDEX=http://192.168.30.84:8099/r/$TOKEN/"

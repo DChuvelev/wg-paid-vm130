@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+BUNDLE_DIR="${1:?Usage: router-bundle-gate BUNDLE_DIR}"
+LEGACY="${ROUTER_BUNDLE_GATE_LEGACY:-/opt/router-ops/libexec/router-bundle-gate-r17}"
+POLICY19="${ROUTER_BUNDLE_POLICY_R19:-/opt/router-ops/bin/router-bundle-policy-r19}"
+POLICY20="${ROUTER_BUNDLE_POLICY_R20:-/opt/router-ops/bin/router-bundle-policy-r20}"
+[[ -x "$LEGACY" ]] || { echo RESULT=STOP_ROUTER_BUNDLE_GATE_LEGACY_MISSING; exit 2; }
+[[ -x "$POLICY19" ]] || { echo RESULT=STOP_ROUTER_BUNDLE_POLICY_R19_MISSING; exit 2; }
+[[ -x "$POLICY20" ]] || { echo RESULT=STOP_ROUTER_BUNDLE_POLICY_R20_MISSING; exit 2; }
+bash "$LEGACY" "$BUNDLE_DIR"
+"$POLICY19" "$BUNDLE_DIR"
+"$POLICY20" "$BUNDLE_DIR"
+# Compatibility markers are part of the shared API. Never remove older PASS markers.
+echo RESULT=PASS_ROUTER_BUNDLE_GATE_R19
+echo RESULT=PASS_ROUTER_BUNDLE_GATE_R20
+echo RESULT=PASS_ROUTER_BUNDLE_GATE

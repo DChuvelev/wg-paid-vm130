@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MAP_YML="/opt/router-ops/inventory/access-map.yml"
+MAP_MD="/opt/router-ops/inventory/access-map.md"
+
+case "${1:-show}" in
+  show)
+    sed -n '1,360p' "$MAP_MD"
+    ;;
+
+  yml|yaml)
+    sed -n '1,620p' "$MAP_YML"
+    ;;
+
+  paths)
+    echo "=== CONFIRMED: pve-wg-paid / MGTS test deployment ==="
+    echo "router-ops -> pve-wg-paid:"
+    echo "  ssh pve-mgts"
+    echo "  key: ~/.ssh/router_ops_pve_mgts_ed25519"
+    echo "  path: router-ops WG 10.250.100.4 -> pve-wg-paid 10.71.100.222"
+    echo
+    echo "pve-wg-paid -> MGTS VM100:"
+    echo "  ssh -n -i /root/.ssh/pve_to_openwrt_mgts_ed25519 root@10.71.100.1"
+    echo
+    echo "pve-wg-paid -> MGTS VM101:"
+    echo "  ssh -n -i /root/.ssh/pve_to_openwrt_mgts_ed25519 root@10.71.100.2"
+    echo
+
+    echo "=== CONFIRMED: home/DDN current machines from router-ops ==="
+    echo "router-ops -> home VM100 core:"
+    echo "  ssh home-vm100"
+    echo "  raw: ssh -i ~/.ssh/router_ops_ed25519 root@192.168.30.1"
+    echo
+    echo "router-ops -> pve-ai:"
+    echo "  ssh pve-ai"
+    echo "  raw: ssh -i ~/.ssh/router_ops_ed25519 root@192.168.30.81"
+    echo
+    echo "router-ops -> VM120 ubuntu-ai:"
+    echo "  ssh ubuntu-ai"
+    echo "  raw: ssh -i ~/.ssh/router_ops_ed25519 root@192.168.30.82"
+    echo
+    echo "router-ops -> VM121 wg-access-dev:"
+    echo "  ssh vm121"
+    echo "  or:  ssh wg-access-dev"
+    echo "  raw: ssh -i ~/.ssh/router_ops_ed25519 root@192.168.30.83"
+    echo
+
+    echo "=== KNOWN BUT NOT CONFIRMED FROM router-ops ==="
+    echo "home VM101 edge:"
+    echo "  address: 192.168.30.2"
+    echo "  last audit: auth failed with known router-ops keys"
+    echo
+    echo "home VM103 wg-easy:"
+    echo "  address: 192.168.30.189"
+    echo "  panel: http://192.168.30.189:51822"
+    echo "  last audit: auth failed with known router-ops keys"
+    echo
+    echo "home VM104 OMR server:"
+    echo "  address: 192.168.30.186"
+    echo "  port: 65222"
+    echo "  last audit: auth failed with known router-ops keys"
+    echo
+
+    echo "=== client001, not currently reachable from router-ops ==="
+    echo "client001 Proxmox:"
+    echo "  ssh root@10.71.1.222"
+    echo "  last audit: no route / timeout"
+    echo
+    echo "client001 VM100 core:"
+    echo "  ssh root@10.71.1.1"
+    echo "  last audit: no route / timeout"
+    echo
+    echo "client001 VM101 edge:"
+    echo "  ssh root@10.71.1.2"
+    echo "  last audit: no route / timeout"
+    echo
+    echo "client001 VM103 wg-easy:"
+    echo "  ssh root@10.71.1.189"
+    echo "  last audit: no route / timeout"
+    ;;
+
+  aliases)
+    echo "=== ~/.ssh/config host blocks ==="
+    awk '
+      /^Host / {print ""; print; show=1; next}
+      show && /^[[:space:]]+(HostName|User|Port|IdentityFile|IdentitiesOnly|ProxyJump|ProxyCommand|StrictHostKeyChecking)/ {print}
+    ' "$HOME/.ssh/config" 2>/dev/null || true
+    ;;
+
+  quick-check)
+    echo "=== confirmed SSH reachability check, no changes ==="
+
+    check() {
+      label="$1"
+      shift
+      echo
+      echo "--- $label ---"
+      "$@" 'echo SSH_OK; hostname 2>/dev/null || cat /proc/sys/kernel/hostname 2>/dev/null || true; echo "SSH_CONNECTION=$SSH_CONNECTION"' 2>&1 | sed -n '1,30p' || true
+    }
+
+    check "pve-mgts" ssh -o BatchMode=yes -o ConnectTimeout=5 pve-mgts
+    check "home-vm100" ssh -o BatchMode=yes -o ConnectTimeout=5 home-vm100
+    check "pve-ai" ssh -o BatchMode=yes -o ConnectTimeout=5 pve-ai
+    check "ubuntu-ai" ssh -o BatchMode=yes -o ConnectTimeout=5 ubuntu-ai
+    check "vm121" ssh -o BatchMode=yes -o ConnectTimeout=5 vm121
+    ;;
+
+  full-audit)
+    /opt/router-ops/inventory/ssh-access-audit.sh
+    ;;
+
+  pve-mgts-check)
+    echo "=== SSH alias pve-mgts ==="
+    grep -A8 '^Host pve-mgts$' "$HOME/.ssh/config" || true
+
+    echo
+    echo "=== WG service ==="
+    systemctl is-enabled wg-quick@router-ops-mgts || true
+    systemctl is-active wg-quick@router-ops-mgts || true
+
+    echo
+    echo "=== WG interface ==="
+    sudo wg show router-ops-mgts || true
+
+    echo
+    echo "=== SSH to pve-mgts ==="
+    ssh -o BatchMode=yes -o ConnectTimeout=5 pve-mgts '
+      echo "SSH_CONNECTION=$SSH_CONNECTION"
+      hostname
+      ip -br addr show dev vmbr0
+      ip -br addr show dev vmbr1
+      ip route
+      qm list
+    '
+    ;;
+
+  *)
+    echo "Usage: access-map [show|yml|paths|aliases|quick-check|full-audit|pve-mgts-check]" >&2
+    exit 2
+    ;;
+esac

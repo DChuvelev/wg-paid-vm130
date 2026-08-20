@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+import csv
+import json
+import re
+import subprocess
+import sys
+from io import StringIO
+from pathlib import Path
+
+INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "mgts-main"
+
+BASE = Path("/opt/router-ops")
+INSTANCE_DIR = BASE / "instances" / INSTANCE
+EGRESS_YML = INSTANCE_DIR / "egress.yml"
+
+PVE = "pve-mgts"
+PVE_KEY = "/root/.ssh/pve_to_openwrt_mgts_ed25519"
+VM101 = "10.71.100.2"
+
+if not EGRESS_YML.exists():
+    print(f"ERROR: missing {EGRESS_YML}", file=sys.stderr)
+    sys.exit(1)
+
+
+def header(title):
+    print()
+    print("################################################################")
+    print(f"### {title}")
+    print("################################################################")
+    print()
+
+
+def clean(v):
+    return (v or "").strip().strip('"').strip("'")
+
+
+def parse_sources_and_slots(text):
+    sources = {}
+    slots = []
+
+    in_hmn = False
+    hmn_indent = None
+
+    for line in text.splitlines():
+        if re.match(r"^\s+hidemyname:\s*$", line):
+            in_hmn = True
+            hmn_indent = len(line) - len(line.lstrip(" "))
+            continue
+
+        if in_hmn:
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip(" "))
+            if stripped and indent <= hmn_indent and not stripped.startswith("#"):
+                in_hmn = False
+            else:
+                for k in [
+                    "candidate_source",
+                    "selected_source",
+                    "fallback_candidate_source",
+                    "quarantine_source",
+                ]:
+                    m = re.match(rf"^\s*{re.escape(k)}:\s*(.+?)\s*$", line)
+                    if m:
+                        sources[k] = clean(m.group(1))
+
+    in_slots = False
+    current = None
+
+    for line in text.splitlines():
+        if re.match(r"^\s*slots:\s*$", line):
+            in_slots = True
+            continue
+
+        if in_slots and re.match(r"^\s{2}[A-Za-z0-9_-]+:\s*$", line) and not line.strip().startswith("- "):
+            if current:
+                slots.append(current)
+                current = None
+            break
+
+        if not in_slots:
+            continue
+
+        m = re.match(r"^\s*-\s*id:\s*(.+?)\s*$", line)
+        if m:
+            if current:
+                slots.append(current)
+            current = {"id": clean(m.group(1))}
+            continue
+
+        if current:
+            m = re.match(r"^\s*([A-Za-z0-9_]+):\s*(.+?)\s*$", line)
+            if m:
+                current[m.group(1)] = clean(m.group(2))
+
+    if current:
+        slots.append(current)
+
+    return sources, slots
+
+
+def vm101(script):
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        PVE,
+        f"ssh -i {PVE_KEY} -o BatchMode=yes -o ConnectTimeout=8 root@{VM101} 'sh -s'",
+    ]
+    p = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    return p.returncode, p.stdout, p.stderr
+
+
+def read_remote_files(paths):
+    qpaths = " ".join("'" + p.replace("'", "'\"'\"'") + "'" for p in paths)
+    script = f"""
+set -eu
+for f in {qpaths}; do
+  echo __BEGIN_FILE__:$f
+  if [ -f "$f" ]; then
+    wc -l < "$f" | sed 's/^/__LINES__:/'
+    sed -n '1,1000p' "$f" | sed -E 's#([A-Za-z0-9+/=]{{32,}})#[REDACTED_LONG_TOKEN]#g'
+  else
+    echo __MISSING__
+  fi
+  echo __END_FILE__:$f
+done
+"""
+    rc, out, err = vm101(script)
+    if rc != 0:
+        print(out, end="")
+        print(err, end="", file=sys.stderr)
+        raise SystemExit(rc)
+
+    files = {}
+    current = None
+    buf = []
+
+    for line in out.splitlines():
+        if line.startswith("__BEGIN_FILE__:"):
+            current = line.split(":", 1)[1]
+            buf = []
+            continue
+        if line.startswith("__END_FILE__:"):
+            files[current] = "\n".join(buf) + ("\n" if buf else "")
+            current = None
+            buf = []
+            continue
+        if current is not None:
+            buf.append(line)
+
+    return files
+
+
+def split_tsv(text):
+    lines = []
+    line_count = None
+    missing = False
+
+    for line in text.splitlines():
+        if line.startswith("__LINES__:"):
+            try:
+                line_count = int(line.split(":", 1)[1])
+            except Exception:
+                line_count = None
+            continue
+        if line == "__MISSING__":
+            missing = True
+            continue
+        if line.strip():
+            lines.append(line)
+
+    if missing or not lines:
+        return line_count, []
+
+    reader = csv.DictReader(StringIO("\n".join(lines) + "\n"), delimiter="\t")
+    rows = []
+    for row in reader:
+        rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
+    return line_count, rows
+
+
+def pick(row, *names):
+    lower = {k.lower(): v for k, v in row.items()}
+    for name in names:
+        v = lower.get(name.lower())
+        if v:
+            return v
+    return ""
+
+
+def basename(path):
+    return (path or "").rstrip("/").split("/")[-1]
+
+
+def norm_candidate(row, source_name):
+    fn_raw = pick(row, "file", "config", "config_path", "path")
+    ep = pick(row, "endpoint")
+    avg = pick(row, "avg_ms", "avg", "rtt", "latency", "ping_rtt_avg")
+    try:
+        avg_float = float(avg)
+    except Exception:
+        avg_float = 999999.0
+    return {
+        "source": source_name,
+        "slot": pick(row, "slot", "id", "name"),
+        "endpoint": ep,
+        "avg_ms": avg,
+        "avg_sort": avg_float,
+        "file": basename(fn_raw),
+        "raw_path": fn_raw,
+    }
+
+
+def row_key(c):
+    return (c.get("endpoint") or "", c.get("file") or "")
+
+
+sources, slots = parse_sources_and_slots(EGRESS_YML.read_text())
+
+candidate_source = sources.get("candidate_source", "/root/hmn/cache/ok-awg1-strict-foreign-latest.tsv")
+selected_source = sources.get("selected_source", "/root/hmn/cache/selected-awg1-latest.tsv")
+fallback_source = sources.get("fallback_candidate_source", "/root/hmn/cache/ok-awg1-strict-all-latest.tsv")
+quarantine_source = sources.get("quarantine_source", "/root/hmn/cache/quarantine-awg1-latest.tsv")
+
+paths = [candidate_source, selected_source, fallback_source, quarantine_source]
+files = read_remote_files(paths)
+
+parsed = {}
+for path in paths:
+    line_count, rows = split_tsv(files.get(path, ""))
+    parsed[path] = {"line_count": line_count, "rows": rows}
+
+primary = [norm_candidate(r, "primary") for r in parsed[candidate_source]["rows"]]
+selected = [norm_candidate(r, "selected") for r in parsed[selected_source]["rows"]]
+quarantine = [norm_candidate(r, "quarantine") for r in parsed[quarantine_source]["rows"]]
+
+quarantine_keys = {row_key(c) for c in quarantine}
+selected_by_slot = {c["slot"]: c for c in selected if c["slot"]}
+
+primary_clean = [c for c in primary if row_key(c) not in quarantine_keys]
+primary_clean.sort(key=lambda c: c["avg_sort"])
+
+plan = []
+used = set()
+
+for s in slots:
+    iface = s.get("iface", "")
+    candidate = None
+    reason = ""
+
+    if iface in selected_by_slot:
+        candidate = selected_by_slot[iface]
+        reason = "preserve_existing_selected"
+    else:
+        for c in primary_clean:
+            if row_key(c) not in used:
+                candidate = c
+                reason = "fill_from_primary"
+                break
+
+    if candidate:
+        used.add(row_key(candidate))
+
+    plan.append({
+        "slot_id": s.get("id", ""),
+        "iface": iface,
+        "table": s.get("table", ""),
+        "fwmark": s.get("fwmark", ""),
+        "reason": reason or "none",
+        "candidate": candidate,
+    })
+
+unique_files = []
+seen = set()
+for p in plan:
+    c = p["candidate"] or {}
+    fn = c.get("file") or ""
+    if fn and fn not in seen:
+        seen.add(fn)
+        unique_files.append(fn)
+
+file_lines = []
+for fn in unique_files:
+    safe = fn.replace("'", "'\"'\"'")
+    file_lines.append(f"echo __FIND_FILE__:'{safe}'")
+    file_lines.append(f"find /root/hmn -type f -name '{safe}' 2>/dev/null | sed -n '1,20p'")
+    file_lines.append(f"echo __END_FIND__:'{safe}'")
+
+remote_check = """
+set -eu
+echo __BASIC__
+date
+ip -br addr
+echo __RULES__
+ip rule
+echo __ROUTES_MAIN__
+ip route | sed -n '1,80p'
+echo __TABLES__
+for t in 200 201 202 203 204 205; do
+  echo TABLE:$t
+  ip route show table "$t" 2>/dev/null || true
+done
+echo __CRON__
+crontab -l 2>/dev/null || true
+echo __HOTPLUG__
+ls -la /etc/hotplug.d/iface
+echo __PROCESSES__
+ps w | grep -E 'vpn-egress-manager|hmn-refresh|hmn-pool|hmn-vpn-user' | grep -v grep || true
+echo __FIREWALL__
+uci show firewall | grep -E 'vpn_out|vpn_in|vpn1|vpn2|vpn3|vpn4|vpn5|vpn_user|vpn_test|forwarding' || true
+echo __UCI_NETWORK_SAFE__
+for i in vpn1 vpn2 vpn3 vpn4 vpn5 vpn_user vpn_test; do
+  echo IFACE:$i
+  for k in proto auto disabled addresses hmn_role hmn_endpoint; do
+    v="$(uci -q get network.$i.$k 2>/dev/null || true)"
+    [ -n "$v" ] && echo "$k=$v"
+  done
+done
+echo __FILE_AVAILABILITY__
+""" + "\n".join(file_lines) + "\n"
+
+rc, remote_out, remote_err = vm101(remote_check)
+
+find_results = {}
+current = None
+buf = []
+for line in remote_out.splitlines():
+    if line.startswith("__FIND_FILE__:"):
+        current = line.split(":", 1)[1].strip("'")
+        buf = []
+        continue
+    if line.startswith("__END_FIND__:"):
+        if current is not None:
+            find_results[current] = list(buf)
+        current = None
+        buf = []
+        continue
+    if current is not None:
+        buf.append(line)
+
+header("HMN APPLY PREFLIGHT")
+print(f"INSTANCE={INSTANCE}")
+print("MODE=READ_ONLY")
+print("REMOTE_CHANGES=NO")
+print("STRATEGY=preserve_existing")
+print()
+
+print(f"candidate_source={candidate_source} rows={len(primary)}")
+print(f"selected_source={selected_source} rows={len(selected)}")
+print(f"quarantine_source={quarantine_source} rows={len(quarantine)}")
+
+header("PROPOSED PRESERVE_EXISTING PLAN")
+print(f"{'slot':<12} {'iface':<6} {'table':<5} {'fwmark':<7} {'reason':<28} {'endpoint':<28} {'avg':<8} file")
+for p in plan:
+    c = p["candidate"] or {}
+    print(
+        f"{p['slot_id']:<12} {p['iface']:<6} {p['table']:<5} {p['fwmark']:<7} "
+        f"{p['reason']:<28} {c.get('endpoint',''):<28} {c.get('avg_ms',''):<8} {c.get('file','')}"
+    )
+
+header("CONFIG FILE AVAILABILITY")
+all_files_ok = True
+for fn in unique_files:
+    paths_found = find_results.get(fn, [])
+    ok = bool(paths_found)
+    if not ok:
+        all_files_ok = False
+    print(f"{fn} -> {'FOUND' if ok else 'MISSING'}")
+    for path in paths_found[:10]:
+        print(f"  {path}")
+
+header("REMOTE SAFETY STATE")
+print(remote_out.split("__FILE_AVAILABILITY__", 1)[0].strip())
+if remote_err:
+    print(remote_err, file=sys.stderr)
+
+header("PREFLIGHT RESULT")
+print(f"remote_check_rc={rc}")
+print(f"config_files_ok={'YES' if all_files_ok else 'NO'}")
+print(f"slot_count={len(plan)}")
+print(f"unique_config_files={len(unique_files)}")
+
+if all_files_ok and len(plan) == 5 and rc == 0:
+    print("PREFLIGHT_DECISION=PASS_READONLY")
+    print("Next safe step: generate an apply plan package, still without applying.")
+else:
+    print("PREFLIGHT_DECISION=BLOCK")
+    print("Do not apply until missing files/errors are resolved.")

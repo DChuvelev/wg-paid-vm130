@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+CORE = "/opt/router-ops/bin/wgpaid-egress-rebalancer-core-step045e2"
+
+def write_json(obj, path):
+    data = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if path == "-":
+        print(data, end="")
+    else:
+        Path(path).write_text(data, encoding="utf-8")
+
+def run_core_json():
+    with tempfile.NamedTemporaryFile(prefix="wgpaid-rebalancer-core-", suffix=".json", delete=False) as f:
+        tmp = f.name
+    try:
+        p = subprocess.run([CORE, "--json-out", tmp], text=True, capture_output=True, timeout=180)
+        if p.returncode != 0:
+            return p.returncode, {}, p.stdout, p.stderr
+        plan = json.loads(Path(tmp).read_text(encoding="utf-8"))
+        return 0, plan, p.stdout, p.stderr
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+def build_preview(plan):
+    actions = plan.get("actions", [])
+    steps = []
+    rollback = []
+
+    for idx, a in enumerate(actions, 1):
+        steps.append({
+            "index": idx,
+            "action": a.get("action"),
+            "peer_id": a.get("peer_id"),
+            "tunnel_ip": a.get("tunnel_ip"),
+            "lock_sql": "SELECT * FROM public.peer_egress_leases WHERE peer_id = $1::uuid FOR UPDATE;",
+            "verify_before_update": {
+                "state_must_equal": "idle",
+                "forced_must_equal": False,
+                "target_id_must_equal": a.get("from_target_id"),
+                "active_peer_move_forbidden": True,
+            },
+            "update_sql_preview": (
+                "UPDATE public.peer_egress_leases "
+                "SET target_id=$new_target_id, egress_class=$new_egress_class, "
+                "assignment_source='rebalancer', reason='rebalancer_idle_reassign', "
+                "cooldown_until=now()+make_interval(secs=>$cooldown_seconds), updated_at=now() "
+                "WHERE peer_id=$peer_id AND state='idle' AND forced=false AND target_id=$old_target_id;"
+            ),
+            "params_preview": {
+                "old_target_id": a.get("from_target_id"),
+                "new_target_id": a.get("to_target_id"),
+                "old_egress_class": a.get("from_egress_class"),
+                "new_egress_class": a.get("to_egress_class"),
+                "cooldown_seconds": plan.get("policy", {}).get("cooldown_seconds"),
+            },
+            "job_payload_json_preview": {
+                "type": "peer_egress_reassign",
+                "peer_id": a.get("peer_id"),
+                "tunnel_ip": a.get("tunnel_ip"),
+                "from_target_id": a.get("from_target_id"),
+                "to_target_id": a.get("to_target_id"),
+                "from_egress_class": a.get("from_egress_class"),
+                "to_egress_class": a.get("to_egress_class"),
+                "reason": "rebalancer_idle_reassign",
+                "requested_by": "wgpaid-egress-rebalancer-once",
+            },
+            "would_write_db": False,
+            "would_create_job": False,
+        })
+        rollback.append({
+            "index": idx,
+            "restore_lease_sql_preview": "restore saved old peer_egress_leases row for this peer_id",
+            "cancel_created_jobs_preview": "only job ids created by this run",
+        })
+
+    return {
+        "schema": "wgpaid-egress-rebalancer-apply-preview-v1",
+        "mode": "apply-preview-no-write",
+        "apply_enabled": False,
+        "write_executed": False,
+        "job_insert_executed": False,
+        "trigger_event_written": False,
+        "source_plan_summary": plan.get("summary", {}),
+        "action_count": len(actions),
+        "transaction": {
+            "would_begin": True,
+            "would_commit": bool(actions),
+            "would_lock_rows": len(actions),
+            "would_update_lease_rows": len(actions),
+            "would_create_jobs": len(actions),
+            "steps": steps,
+        },
+        "rollback_preview": {
+            "required": True,
+            "steps": rollback,
+        },
+        "safety": {
+            "db_written": False,
+            "jobs_created": False,
+            "selector_changed": False,
+            "wg_runtime_changed": False,
+            "apply_still_disabled": True,
+        },
+    }
+
+def main():
+    ap = argparse.ArgumentParser(description="WG Paid egress rebalancer wrapper")
+    ap.add_argument("--apply", action="store_true", help="refused; real apply is not enabled")
+    ap.add_argument("--apply-preview", action="store_true", help="non-writing transaction/job/rollback preview")
+    ap.add_argument("--json-out", default="-")
+    args = ap.parse_args()
+
+    if args.apply:
+        write_json({
+            "schema": "wgpaid-egress-rebalancer-plan-v1",
+            "mode": "refused",
+            "error": "--apply is intentionally disabled; use --apply-preview for non-writing preview",
+            "would_write": False,
+        }, args.json_out)
+        sys.exit(78)
+
+    if args.apply_preview:
+        rc, plan, stdout, stderr = run_core_json()
+        if rc != 0:
+            write_json({
+                "schema": "wgpaid-egress-rebalancer-apply-preview-v1",
+                "mode": "error",
+                "core_rc": rc,
+                "core_stdout": stdout,
+                "core_stderr": stderr,
+                "write_executed": False,
+                "job_insert_executed": False,
+            }, args.json_out)
+            sys.exit(rc)
+        write_json(build_preview(plan), args.json_out)
+        return
+
+    os.execv(CORE, [CORE] + sys.argv[1:])
+
+if __name__ == "__main__":
+    main()

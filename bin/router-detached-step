@@ -1,0 +1,185 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+TOOL_BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+STATE_ROOT="${ROUTER_DETACHED_ROOT:-$TOOL_BASE/state/detached-step-runs}"
+SELF="$(readlink -f "$0")"
+
+usage() {
+    echo 'Usage: router-detached-step start --step STEP --zip ZIP --sha256 SHA --entry REL [--runtime-base DIR] [--source-root DIR] [--incoming DIR] [--public-token-file FILE] [--public-root DIR] [--home DIR] [--selftest true|false] | control --step STEP status|follow|result' >&2
+    exit 2
+}
+valid_step() { [[ "$1" =~ ^[A-Za-z0-9_.-]+$ ]]; }
+active_run() {
+    local run_dir="$1" pid token current_token
+    [[ -f "$run_dir/pid" && -f "$run_dir/process-token" ]] || return 1
+    pid="$(cat "$run_dir/pid")"; token="$(cat "$run_dir/process-token")"
+    [[ "$pid" =~ ^[0-9]+$ && -r "/proc/$pid/stat" ]] || return 1
+    current_token="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+    [[ -n "$current_token" && "$current_token" == "$token" ]]
+}
+current_run_dir() {
+    local step="$1" step_root="$STATE_ROOT/$step" run_id
+    [[ -f "$step_root/current-run" ]] || return 1
+    run_id="$(cat "$step_root/current-run")"
+    [[ -n "$run_id" && -d "$step_root/runs/$run_id" ]] || return 1
+    printf '%s\n' "$step_root/runs/$run_id"
+}
+make_control() {
+    local step="$1" step_root="$STATE_ROOT/$step" quoted_self quoted_step quoted_state
+    printf -v quoted_self '%q' "$SELF"; printf -v quoted_step '%q' "$step"; printf -v quoted_state '%q' "$STATE_ROOT"
+    cat > "$step_root/control.sh" <<EOF
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ \$# -eq 1 ]] || { echo 'Usage: control.sh status|follow|result' >&2; exit 2; }
+ROUTER_DETACHED_ROOT=$quoted_state exec $quoted_self control --step $quoted_step "\$1"
+EOF
+    chmod 700 "$step_root/control.sh"
+}
+safe_extract() {
+    local zip="$1" destination="$2" expected_step="$3" tool="$TOOL_BASE/bin/router-zip-contract"
+    [[ -x "$tool" ]] || { echo RESULT=STOP_DETACHED_ZIP_TOOL_MISSING; return 23; }
+    "$tool" verify --zip "$zip" --root "$expected_step" --canonical
+    "$tool" extract --zip "$zip" --destination "$destination" --root "$expected_step" --canonical
+}
+start_run() {
+    local step='' zip='' sha='' entry=''
+    local runtime_base='/opt/router-ops' source_root='' incoming='/home/ops/incoming'
+    local token_file='' public_root='' child_home="${HOME:-/home/ops}" selftest='false'
+    while (($#)); do
+        case "$1" in
+            --step) step="$2"; shift 2;;
+            --zip) zip="$2"; shift 2;;
+            --sha256) sha="$2"; shift 2;;
+            --entry) entry="$2"; shift 2;;
+            --runtime-base) runtime_base="$2"; shift 2;;
+            --source-root) source_root="$2"; shift 2;;
+            --incoming) incoming="$2"; shift 2;;
+            --public-token-file) token_file="$2"; shift 2;;
+            --public-root) public_root="$2"; shift 2;;
+            --home) child_home="$2"; shift 2;;
+            --selftest) selftest="$2"; shift 2;;
+            *) usage;;
+        esac
+    done
+    valid_step "$step" || usage
+    [[ -f "$zip" && "$sha" =~ ^[0-9a-f]{64}$ ]] || usage
+    [[ -n "$entry" && "$entry" != /* && "$entry" != *'..'* ]] || usage
+    [[ -d "$runtime_base" ]] || { echo RESULT=STOP_DETACHED_RUNTIME_BASE_MISSING; echo "RUNTIME_BASE=$runtime_base"; exit 24; }
+    [[ -n "$source_root" ]] || source_root="$runtime_base"
+    [[ -d "$source_root" ]] || { echo RESULT=STOP_DETACHED_SOURCE_ROOT_MISSING; echo "SOURCE_ROOT=$source_root"; exit 24; }
+    [[ -n "$token_file" ]] || token_file="$runtime_base/public/.router-public-token"
+    [[ "$selftest" == true || "$selftest" == false ]] || usage
+
+    local step_root="$STATE_ROOT/$step"
+    mkdir -p "$step_root/runs"; chmod 700 "$step_root" "$step_root/runs"
+    exec 9>"$step_root/runner.lock"; flock 9
+    local previous=''; previous="$(current_run_dir "$step" 2>/dev/null || true)"
+    if [[ -n "$previous" ]] && active_run "$previous"; then
+        echo RESULT=STOP_DETACHED_RUNNER_ALREADY_ACTIVE; echo "RUN_DIR=$previous"; echo "CONTROL=$step_root/control.sh"; exit 20
+    fi
+
+    local run_id run_dir immutable extracted entry_absolute
+    run_id="$(date -u +%Y%m%d-%H%M%S)-$$-${RANDOM}"
+    run_dir="$step_root/runs/$run_id"; immutable="$run_dir/immutable-step.zip"; extracted="$run_dir/extracted"
+    mkdir -p "$run_dir" "$extracted"; chmod 700 "$run_dir" "$extracted"
+    cp "$zip" "$immutable"; echo "$sha  $immutable" | sha256sum -c - >/dev/null
+    safe_extract "$immutable" "$extracted" "$step"
+    entry_absolute="$extracted/$step/$entry"
+    [[ -f "$entry_absolute" ]] || { echo RESULT=STOP_DETACHED_ENTRY_MISSING; echo "ENTRY=$entry"; exit 21; }
+    chmod 700 "$entry_absolute"
+
+    find "$incoming" -maxdepth 1 -type f -name 'WG_PAID_MGTS_LATEST_*.zip' -printf '%f\n' 2>/dev/null | LC_ALL=C sort > "$run_dir/previous-latest.txt" || true
+
+    cat > "$run_dir/worker.sh" <<'WORKER'
+#!/usr/bin/env bash
+set -uo pipefail
+run_dir="$1"; step="$2"; entry="$3"; bundle_root="$4"; immutable="$5"
+runtime_base="$6"; source_root="$7"; incoming="$8"; token_file="$9"; public_root="${10}"
+child_home="${11}"; bundle_sha="${12}"; selftest="${13}"
+log="$run_dir/run.log"; child_env="$run_dir/child-result.env"
+: > "$log"
+child_args=(env -i PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' HOME="$child_home" PYTHONDONTWRITEBYTECODE=1
+    ROUTER_OPS_BASE="$runtime_base" ROUTER_VM130_SOURCE_ROOT="$source_root" ROUTER_STEP_INCOMING="$incoming"
+    ROUTER_PUBLIC_TOKEN_FILE="$token_file" ROUTER_EXACT_WORKER_SELFTEST="$selftest"
+    ROUTER_DETACHED_RUN_DIR="$run_dir" ROUTER_DETACHED_CHILD_RESULT="$child_env"
+    BUNDLE_ROOT="$bundle_root" BUNDLE_ZIP="$immutable" EXPECTED_BUNDLE_SHA256="$bundle_sha")
+[[ -n "$public_root" ]] && child_args+=(ROUTER_PUBLIC_ROOT="$public_root")
+set +e
+"${child_args[@]}" "$entry" >>"$log" 2>&1
+rc=$?
+
+find "$incoming" -maxdepth 1 -type f -name 'WG_PAID_MGTS_LATEST_*.zip' -printf '%f\n' 2>/dev/null | LC_ALL=C sort > "$run_dir/final-latest.txt" || true
+newest="$(comm -13 "$run_dir/previous-latest.txt" "$run_dir/final-latest.txt" | tail -n1)"
+
+# Ultimate fallback: use the real runtime workflow, never the staged tool root.
+if [[ "$rc" -ne 0 && -z "$newest" && -r "$runtime_base/lib/router-step-workflow.sh" ]]; then
+    export ROUTER_OPS_BASE="$runtime_base" ROUTER_VM130_SOURCE_ROOT="$source_root" ROUTER_STEP_INCOMING="$incoming" ROUTER_PUBLIC_TOKEN_FILE="$token_file"
+    [[ -n "$public_root" ]] && export ROUTER_PUBLIC_ROOT="$public_root" || unset ROUTER_PUBLIC_ROOT
+    source "$runtime_base/lib/router-step-workflow.sh"
+    router_step_archive_latest_python "$runtime_base" "$incoming" "$(date -u +%Y%m%d-%H%M%S)" > "$run_dir/runner-emergency-latest.log" 2>&1 || true
+    newest="$(awk -F= '$1=="LATEST_ARCHIVE"{print substr($0,index($0,"=")+1)}' "$run_dir/runner-emergency-latest.log" | tail -n1)"
+    [[ -n "$newest" ]] && newest="$(basename "$newest")"
+    find "$incoming" -maxdepth 1 -type f -name 'WG_PAID_MGTS_LATEST_*.zip' -printf '%f\n' 2>/dev/null | LC_ALL=C sort > "$run_dir/final-latest.txt" || true
+fi
+
+tmp="$run_dir/result.env.tmp.$$"
+{
+    echo RUNNER_STATE=complete
+    echo "STEP=$step"; echo "RUN_ID=$(basename "$run_dir")"; echo "RUN_DIR=$run_dir"; echo "RUNNER_RC=$rc"
+    echo "RUNNER_RUNTIME_BASE=$runtime_base"; echo "RUNNER_SOURCE_ROOT=$source_root"; echo "RUNNER_INCOMING=$incoming"
+    awk '/^RESULT=/{value=$0} END{if(value) print "CHILD_FINAL_" value}' "$log"
+    [[ -f "$child_env" ]] && cat "$child_env" || echo CHILD_RESULT_MISSING=true
+    if [[ -n "$newest" && -f "$incoming/$newest" ]]; then
+        echo "FINAL_LATEST_ARCHIVE=$incoming/$newest"
+        echo "FINAL_LATEST_ARCHIVE_SHA256=$(sha256sum "$incoming/$newest" | awk '{print $1}')"
+    elif [[ "$rc" -ne 0 ]]; then
+        echo FINAL_LATEST_ARCHIVE=not_created
+    fi
+} > "$tmp"
+chmod 600 "$tmp"; mv -f "$tmp" "$run_dir/result.env"
+exit "$rc"
+WORKER
+    chmod 700 "$run_dir/worker.sh"; : > "$run_dir/run.log"; chmod 600 "$run_dir/run.log"
+
+    local pid token='' attempt
+    pid="$(python3 -I - "$run_dir/worker.sh" "$run_dir" "$step" "$entry_absolute" "$extracted/$step" "$immutable" "$runtime_base" "$source_root" "$incoming" "$token_file" "$public_root" "$child_home" "$sha" "$selftest" <<'PYLAUNCH'
+import os,subprocess,sys
+with open(os.devnull,'rb') as si, open(os.devnull,'ab',buffering=0) as so:
+    p=subprocess.Popen(sys.argv[1:],stdin=si,stdout=so,stderr=so,close_fds=True,start_new_session=True)
+print(p.pid)
+PYLAUNCH
+)"
+    [[ "$pid" =~ ^[0-9]+$ ]]
+    echo "$pid" > "$run_dir/pid"
+    for attempt in $(seq 1 50); do
+        [[ -r "/proc/$pid/stat" ]] && token="$(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || true)"
+        [[ -n "$token" ]] && break; sleep 0.02
+    done
+    [[ -n "$token" ]] || { echo RESULT=STOP_DETACHED_WORKER_PID_NOT_TRACKABLE; echo "PID=$pid"; echo "RUN_DIR=$run_dir"; exit 22; }
+    echo "$token" > "$run_dir/process-token"
+    printf '%s\n' "$run_id" > "$step_root/current-run.tmp.$$"; mv -f "$step_root/current-run.tmp.$$" "$step_root/current-run"
+    make_control "$step"
+    echo "RESULT=PASS_${step}_DETACHED_RUNNER_STARTED"; echo "RUN_ID=$run_id"; echo "RUN_DIR=$run_dir"; echo "PID=$pid"; echo "LOG=$run_dir/run.log"
+    echo "CONTROL=$step_root/control.sh"; echo "STATUS_COMMAND=$step_root/control.sh status"; echo "FOLLOW_COMMAND=$step_root/control.sh follow"; echo "RESULT_COMMAND=$step_root/control.sh result"
+    echo "RUNTIME_BASE=$runtime_base"; echo "SOURCE_ROOT=$source_root"; echo "INCOMING=$incoming"
+}
+control_run() {
+    local step=''; [[ "${1:-}" == --step ]] || usage; step="$2"; shift 2; [[ $# -eq 1 ]] || usage
+    local action="$1"; valid_step "$step" || usage
+    local run_dir; run_dir="$(current_run_dir "$step")" || { echo RESULT=STOP_DETACHED_RUN_NOT_FOUND; exit 30; }
+    case "$action" in
+        status)
+            if [[ -f "$run_dir/result.env" ]]; then echo DETACHED_STATUS=complete; cat "$run_dir/result.env"
+            else if active_run "$run_dir"; then echo DETACHED_STATUS=running; else echo DETACHED_STATUS=stale; fi; echo "RUN_DIR=$run_dir"; tail -n 20 "$run_dir/run.log" 2>/dev/null || true; fi;;
+        follow)
+            if [[ -f "$run_dir/result.env" ]]; then cat "$run_dir/run.log"; cat "$run_dir/result.env"; exit 0; fi
+            local pid; pid="$(cat "$run_dir/pid")"; tail --pid="$pid" -n +1 -f "$run_dir/run.log" || true; [[ -f "$run_dir/result.env" ]] && cat "$run_dir/result.env";;
+        result)
+            [[ -f "$run_dir/result.env" ]] || { echo RESULT=STOP_DETACHED_RESULT_NOT_READY; echo "RUN_DIR=$run_dir"; exit 31; }; cat "$run_dir/result.env";;
+        *) usage;;
+    esac
+}
+[[ $# -ge 1 ]] || usage; command="$1"; shift
+case "$command" in start) start_run "$@";; control) control_run "$@";; *) usage;; esac

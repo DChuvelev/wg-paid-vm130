@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+import json,re,sys
+from pathlib import Path
+root=Path(sys.argv[1] if len(sys.argv)>1 else '').resolve(); errors=[]
+def fail(code,detail): errors.append(f'{code}:{detail}')
+def text(path):
+    try: return path.read_text(encoding='utf-8')
+    except Exception: return ''
+for rel in ('install.sh','release-info.json','tests/mandatory.list'):
+    if not (root/rel).is_file(): fail('missing_required',rel)
+try: info=json.loads(text(root/'release-info.json'))
+except Exception as exc: fail('release_info_invalid',str(exc)); info={}
+mandatory=[x.strip() for x in text(root/'tests/mandatory.list').splitlines() if x.strip() and not x.lstrip().startswith('#')]
+install=text(root/'install.sh')
+production=[root/'install.sh']
+for sub in ('scripts','rollback','payload/rootfs'):
+    base=root/sub
+    if base.exists(): production += [p for p in base.rglob('*') if p.is_file() and (p.suffix=='.sh' or p.name.startswith('router-') or p.name=='install.sh')]
+assign_re=re.compile(r'''([A-Za-z_][A-Za-z0-9_]*)=("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\S+)''')
+var_re=re.compile(r'\$(?:\{([A-Za-z_][A-Za-z0-9_]*)[^}]*\}|([A-Za-z_][A-Za-z0-9_]*))')
+def command_start(line,pos):
+    j=pos-1
+    while j>=0 and line[j].isspace(): j-=1
+    if j<0 or line[j] in ';{}|&': return True
+    k=j
+    while k>=0 and (line[k].isalnum() or line[k]=='_'): k-=1
+    return line[k+1:j+1] in {'then','do','else','elif'}
+def local_segments(line):
+    out=[]; i=0; quote=None; escaped=False; n=len(line)
+    while i<n:
+        c=line[i]
+        if quote:
+            if quote=='"' and escaped: escaped=False
+            elif quote=='"' and c=='\\': escaped=True
+            elif c==quote: quote=None
+            i+=1; continue
+        if c in "'\"": quote=c; i+=1; continue
+        if c=='#' and (i==0 or line[i-1].isspace()): break
+        token=None
+        for candidate in ('local','declare'):
+            if line.startswith(candidate,i) and (i==0 or not (line[i-1].isalnum() or line[i-1]=='_')):
+                e=i+len(candidate)
+                if e<n and line[e].isspace() and command_start(line,i): token=candidate; break
+        if token:
+            start=i+len(token); j=start; q=None; esc=False
+            while j<n:
+                d=line[j]
+                if q:
+                    if q=='"' and esc: esc=False
+                    elif q=='"' and d=='\\': esc=True
+                    elif d==q: q=None
+                else:
+                    if d in "'\"": q=d
+                    elif d==';': break
+                    elif d=='#' and (j==0 or line[j-1].isspace()): break
+                j+=1
+            out.append(line[start:j]); i=j+1; continue
+        i+=1
+    return out
+for p in production:
+    for n,line in enumerate(text(p).splitlines(),1):
+        for segment in local_segments(line):
+            segment=re.sub(r'^\s+-[a-zA-Z]+\s+','',segment)
+            seen=[]
+            for m in assign_re.finditer(segment):
+                name,rhs=m.group(1),m.group(2)
+                refs={a or b for a,b in var_re.findall(rhs)}
+                bad=sorted(refs.intersection(seen))
+                if bad: fail('bash_same_command_assignment_reference',f'{p.relative_to(root)}:{n}:{name}->{",".join(bad)}')
+                seen.append(name)
+if 'model_publication' in install or 'methods_publication' in install:
+    if 'router-public-safe-payload' not in install: fail('publication_safe_payload_missing','install.sh')
+    if 'publication_safe_payload_runtime.sh' not in mandatory: fail('publication_safe_payload_runtime_fixture_missing','tests/mandatory.list')
+if info.get('functional_stage')=='degraded_pool':
+    req={'source_of_truth':'machine_git','vm101_inventory_repeated':False,'full_rootfs_snapshot':False,'private_key_material_exported':False,'direct_failopen_allowed':False,'retry_interval_sec':1800,'retry_tick_interval_sec':60,'state_schema_version':1,'snapshot_name_preferred_max_length':32}
+    for k,v in req.items():
+        if info.get(k)!=v: fail('degraded_metadata_mismatch',f'{k}={info.get(k)!r}')
+    required_fixtures={'degraded_failure_preserves_active.sh','retry_before_due_rejected.sh','retry_at_due_allowed.sh','retry_lock_concurrency.sh','degraded_state_survives_boot.sh','successful_retry_returns_normal.sh','counter_reset_after_activation_only.sh','direct_failopen_disabled.sh','publication_safe_payload_runtime.sh','bash_local_assignment_runtime.sh'}
+    missing=sorted(required_fixtures-set(mandatory))
+    if missing: fail('degraded_fixture_missing',','.join(missing))
+    required_keys={'mode','degraded_reason','degraded_since_epoch','failed_attempt_id','last_refresh_result','last_refresh_epoch','next_refresh_epoch','refresh_retry_count','last_retry_epoch','last_retry_result','active_generation_id','healthy_slot_count_at_failure'}
+    got=set(info.get('required_state_keys') or [])
+    if not required_keys.issubset(got): fail('degraded_state_key_missing',','.join(sorted(required_keys-got)))
+    order=info.get('lock_order') or []
+    if order[:2]!=['recovery-coordinator','operation-specific']: fail('degraded_lock_order_invalid',repr(order))
+    snap=info.get('snapshot_name')
+    if snap is not None and len(snap)>32: fail('snapshot_name_over_preferred_limit',str(len(snap)))
+if info.get('functional_stage') in ('degraded_pool','degraded_pool_design') and info.get('direct_failopen_allowed') is not False:
+    fail('direct_failopen_must_be_false','release-info.json')
+if errors:
+    for e in errors: print(f'POLICY_ERROR={e}',file=sys.stderr)
+    print('RESULT=STOP_ROUTER_BUNDLE_POLICY_R20',file=sys.stderr); raise SystemExit(51)
+print('RESULT=PASS_ROUTER_BUNDLE_POLICY_R20')
+print(f'MANDATORY_FIXTURE_COUNT={len(mandatory)}')
+print('R20_SHARED_POLICY_APPLIED=true')

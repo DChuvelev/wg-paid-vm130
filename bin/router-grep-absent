@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Exit 0 when PATTERN is absent.
+# Exit 1 when PATTERN is present.
+# Exit 64 on usage error.
+set -u
+
+if [ "$#" -lt 2 ]; then
+  echo "usage: router-grep-absent PATTERN FILE..." >&2
+  exit 64
+fi
+
+pattern="$1"
+shift
+
+grep -E -- "$pattern" "$@" >/dev/null 2>&1
+rc="$?"
+
+case "$rc" in
+  0) exit 1 ;;   # found => expected absence violated
+  1) exit 0 ;;   # not found => OK
+  *) exit "$rc" ;;
+esac

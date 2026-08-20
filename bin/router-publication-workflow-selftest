@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+PUBLISHER="${ROUTER_PUBLISHER_UNDER_TEST:-/opt/router-ops/bin/router-publish-report}"
+WORK="$(mktemp -d /tmp/router-publication-workflow-selftest.XXXXXX)"; trap 'rm -rf "$WORK"' EXIT
+BASE="$WORK/base"; TOKEN=test-token; ROOT="$BASE/public/r/$TOKEN"; mkdir -p "$ROOT/latest" "$ROOT/old" "$BASE/bin" "$BASE/state"
+printf '%s\n' "$TOKEN" > "$BASE/public/.router-public-token"
+cat > "$WORK/reindex" <<'SH'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[[ "${REINDEX_FAIL:-false}" != true ]] || exit 9
+root="${ROUTER_PUBLIC_ROOT:?}"
+for d in latest old; do
+  { echo '<html><body>'; find "$root/$d" -mindepth 1 -maxdepth 1 -type d -printf '%f/\n' | sort; echo '</body></html>'; } > "$root/$d/index.html"
+done
+SH
+chmod 700 "$WORK/reindex"
+run_pub(){ local ts="$1" payload="$2" log="$3"; ROUTER_OPS_BASE="$BASE" ROUTER_PUBLIC_TOKEN="$TOKEN" ROUTER_PUBLIC_ROOT="$ROOT" ROUTER_PUBLIC_REINDEX="$WORK/reindex" ROUTER_PUBLISH_TIMESTAMP_OVERRIDE="$ts" "$PUBLISHER" vm130_router_ops_source_snapshot_selftest "$payload" > "$log" 2>&1; }
+field(){ awk -F= -v k="$2" '$1==k{print substr($0,index($0,"=")+1)}' "$1"|tail -1; }
+printf 'A\n' > "$WORK/payload.txt"
+run_pub 20260717-000001 "$WORK/payload.txt" "$WORK/one.log"
+grep -qx RESULT=PASS_ROUTER_PUBLISH_REPORT "$WORK/one.log"; grep -qx PUBLICATION_REUSED=false "$WORK/one.log"
+first="$(field "$WORK/one.log" PUBLISHED_DIR)"; [[ -d "$first" ]]
+run_pub 20260717-000002 "$WORK/payload.txt" "$WORK/reuse.log"
+grep -qx PUBLICATION_REUSED=true "$WORK/reuse.log"; [[ "$(field "$WORK/reuse.log" PUBLISHED_DIR)" == "$first" ]]
+printf 'B\n' > "$WORK/payload.txt"
+run_pub 20260717-000003 "$WORK/payload.txt" "$WORK/two.log"
+second="$(field "$WORK/two.log" PUBLISHED_DIR)"; [[ -d "$second" && -d "$ROOT/old/$(basename "$first")" ]]
+cp -a "$second" "$ROOT/old/$(basename "$second")"
+printf 'C\n' > "$WORK/payload.txt"
+run_pub 20260717-000004 "$WORK/payload.txt" "$WORK/dedup.log"
+grep -qx COLLISION_DEDUPLICATED_COUNT=1 "$WORK/dedup.log"
+third="$(field "$WORK/dedup.log" PUBLISHED_DIR)"; [[ -d "$third" ]]
+cp -a "$third" "$ROOT/old/$(basename "$third")"; printf 'mismatch\n' >> "$ROOT/old/$(basename "$third")/payload.txt"
+printf 'D\n' > "$WORK/payload.txt"
+set +e
+run_pub 20260717-000005 "$WORK/payload.txt" "$WORK/mismatch.log"; rc=$?
+set -e
+[[ "$rc" -ne 0 ]]; grep -qx STOP_CODE=HISTORY_COLLISION_MISMATCH "$WORK/mismatch.log"; [[ -d "$third" ]]
+rm -rf "$ROOT/old/$(basename "$third")"
+printf 'E\n' > "$WORK/payload.txt"
+set +e
+REINDEX_FAIL=true ROUTER_OPS_BASE="$BASE" ROUTER_PUBLIC_TOKEN="$TOKEN" ROUTER_PUBLIC_ROOT="$ROOT" ROUTER_PUBLIC_REINDEX="$WORK/reindex" ROUTER_PUBLISH_TIMESTAMP_OVERRIDE=20260717-000006 "$PUBLISHER" vm130_router_ops_source_snapshot_selftest "$WORK/payload.txt" > "$WORK/reindex-fail.log" 2>&1; rc=$?
+set -e
+[[ "$rc" -ne 0 ]]; grep -qx STOP_CODE=REINDEX_FAILED "$WORK/reindex-fail.log"; [[ -d "$third" ]]
+[[ "$(find "$ROOT/latest" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 1 ]]
+echo RESULT=PASS_ROUTER_PUBLICATION_WORKFLOW_SELFTEST

@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+
+URL=""
+OUTPUT=""
+EXPECTED_SHA=""
+EXPECTED_CODE="200"
+RETRIES="${ROUTER_HTTP_RETRIES:-5}"
+DELAY="${ROUTER_HTTP_DELAY_SEC:-1}"
+HOST="${ROUTER_HTTP_HOST:-reports.secret-studio.ru}"
+RESOLVE_IP="${ROUTER_HTTP_RESOLVE_IP:-10.71.100.84}"
+CACHE_BUST="true"
+CURL_BIN="${ROUTER_HTTP_CURL_BIN:-curl}"
+CONNECT_TIMEOUT="${ROUTER_HTTP_CONNECT_TIMEOUT:-10}"
+MAX_TIME="${ROUTER_HTTP_MAX_TIME:-30}"
+
+usage() {
+    echo 'Usage: router-http-verify --url URL [--output FILE] [--sha256 HEX] [--expected-code CODE] [--retries N] [--delay SEC] [--no-cache-bust]' >&2
+    exit 2
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --url) URL="${2:-}"; shift 2 ;;
+        --output) OUTPUT="${2:-}"; shift 2 ;;
+        --sha256) EXPECTED_SHA="${2:-}"; shift 2 ;;
+        --expected-code) EXPECTED_CODE="${2:-}"; shift 2 ;;
+        --retries) RETRIES="${2:-}"; shift 2 ;;
+        --delay) DELAY="${2:-}"; shift 2 ;;
+        --no-cache-bust) CACHE_BUST=false; shift ;;
+        *) usage ;;
+    esac
+done
+
+[[ -n "$URL" ]] || usage
+[[ "$RETRIES" =~ ^[1-9][0-9]*$ ]] || usage
+[[ "$DELAY" =~ ^[0-9]+([.][0-9]+)?$ ]] || usage
+[[ "$EXPECTED_CODE" =~ ^[0-9]{3}$ ]] || usage
+if [[ -n "$EXPECTED_SHA" ]]; then
+    [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]] || usage
+fi
+command -v "$CURL_BIN" >/dev/null 2>&1 || {
+    echo RESULT=STOP_ROUTER_HTTP_VERIFY
+    echo STOP_REASON=CURL_MISSING
+    exit 20
+}
+
+TMP_ROOT="$(mktemp -d /tmp/router-http-verify.XXXXXX)"
+trap 'rm -rf "$TMP_ROOT"' EXIT INT TERM HUP
+[[ -n "$OUTPUT" ]] || OUTPUT="$TMP_ROOT/body.out"
+mkdir -p "$(dirname "$OUTPUT")"
+
+LAST_CODE="000"
+LAST_RC=0
+LAST_SHA=""
+for (( attempt=1; attempt<=RETRIES; attempt++ )); do
+    TMP_BODY="$TMP_ROOT/body.$attempt"
+    VERIFY_URL="$URL"
+    if [[ "$CACHE_BUST" == true ]]; then
+        SEP='?'
+        [[ "$VERIFY_URL" == *\?* ]] && SEP='&'
+        VERIFY_URL="${VERIFY_URL}${SEP}_router_verify=$(date +%s)-$$-$attempt"
+    fi
+
+    ARGS=(--silent --show-error --location --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" -o "$TMP_BODY" -w '%{http_code}')
+    if [[ -n "$HOST" && -n "$RESOLVE_IP" && "$URL" == https://"$HOST"/* ]]; then
+        ARGS+=(--resolve "$HOST:443:$RESOLVE_IP")
+    fi
+
+    set +e
+    LAST_CODE="$("$CURL_BIN" "${ARGS[@]}" "$VERIFY_URL")"
+    LAST_RC=$?
+    set -e
+    [[ -n "$LAST_CODE" ]] || LAST_CODE=000
+    LAST_SHA=""
+    [[ ! -f "$TMP_BODY" ]] || LAST_SHA="$(sha256sum "$TMP_BODY" | awk '{print $1}')"
+
+    echo "ATTEMPT=$attempt HTTP_RC=$LAST_RC HTTP_CODE=$LAST_CODE BODY_SHA256=${LAST_SHA:-none}" >&2
+
+    if [[ "$LAST_RC" -eq 0 && "$LAST_CODE" == "$EXPECTED_CODE" ]]; then
+        if [[ -z "$EXPECTED_SHA" || "$LAST_SHA" == "$EXPECTED_SHA" ]]; then
+            mv -f "$TMP_BODY" "$OUTPUT"
+            echo RESULT=PASS_ROUTER_HTTP_VERIFY
+            echo HTTP_POSTCHECK=PASS
+            echo HTTP_URL="$URL"
+            echo HTTP_CODE="$LAST_CODE"
+            echo HTTP_ATTEMPTS="$attempt"
+            echo HTTP_SHA256="${LAST_SHA:-none}"
+            echo HTTP_OUTPUT="$OUTPUT"
+            exit 0
+        fi
+    fi
+
+    if (( attempt < RETRIES )); then
+        sleep "$DELAY"
+    fi
+done
+
+echo RESULT=STOP_ROUTER_HTTP_VERIFY
+echo STOP_REASON=HTTP_OR_SHA_MISMATCH
+echo HTTP_URL="$URL"
+echo HTTP_CODE="$LAST_CODE"
+echo HTTP_RC="$LAST_RC"
+echo HTTP_SHA256="${LAST_SHA:-none}"
+echo EXPECTED_HTTP_CODE="$EXPECTED_CODE"
+echo EXPECTED_SHA256="${EXPECTED_SHA:-none}"
+exit 1

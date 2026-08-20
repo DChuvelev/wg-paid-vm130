@@ -1,0 +1,21 @@
+#!/bin/sh
+set -eu
+
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+PUBLIC="$BASE/public"
+PUBLIC_BASE="${ROUTER_PUBLIC_BASE_URL:-https://reports.secret-studio.ru}"
+PUBLIC_BASE="${PUBLIC_BASE%/}"
+TOKEN_FILE="${ROUTER_PUBLIC_TOKEN_FILE:-$PUBLIC/.router-public-token}"
+TOKEN="${ROUTER_PUBLIC_TOKEN:-}"
+
+if [ -z "$TOKEN" ]; then
+  TOKEN="$(cat "$TOKEN_FILE")"
+fi
+
+printf 'TOKEN=%s\n' "$TOKEN"
+printf 'LOCAL_ROOT=http://192.168.30.84:8099/r/%s/\n' "$TOKEN"
+printf 'LOCAL_INDEX=http://192.168.30.84:8099/r/%s/latest/\n' "$TOKEN"
+printf 'PUBLIC_ROOT_URL=%s/\n' "$PUBLIC_BASE"
+printf 'LATEST_ROOT_URL=%s/latest/\n' "$PUBLIC_BASE"
+printf 'OLD_ROOT_URL=%s/old/\n' "$PUBLIC_BASE"
+printf 'PUBLIC_INDEX=%s/latest/\n' "$PUBLIC_BASE"

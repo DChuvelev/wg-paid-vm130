@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+import csv
+import re
+import subprocess
+import sys
+from io import StringIO
+from pathlib import Path
+
+INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "mgts-main"
+
+BASE = Path("/opt/router-ops")
+INSTANCE_DIR = BASE / "instances" / INSTANCE
+EGRESS_YML = INSTANCE_DIR / "egress.yml"
+
+PVE = "pve-mgts"
+PVE_KEY = "/root/.ssh/pve_to_openwrt_mgts_ed25519"
+VM101 = "10.71.100.2"
+
+if not EGRESS_YML.exists():
+    print(f"ERROR: missing {EGRESS_YML}", file=sys.stderr)
+    sys.exit(1)
+
+
+def header(title: str) -> None:
+    print()
+    print("################################################################")
+    print(f"### {title}")
+    print("################################################################")
+    print()
+
+
+def parse_hmn_sources(text: str) -> dict:
+    keys = [
+        "candidate_source",
+        "selected_source",
+        "fallback_candidate_source",
+        "quarantine_source",
+        "legacy_empty_config_dir",
+    ]
+    out = {}
+    in_hmn = False
+    hmn_indent = None
+
+    for line in text.splitlines():
+        if re.match(r"^\s+hidemyname:\s*$", line):
+            in_hmn = True
+            hmn_indent = len(line) - len(line.lstrip(" "))
+            continue
+
+        if in_hmn:
+            stripped = line.strip()
+            indent = len(line) - len(line.lstrip(" "))
+            if stripped and indent <= hmn_indent and not stripped.startswith("#"):
+                break
+
+            for k in keys:
+                m = re.match(rf"^\s*{re.escape(k)}:\s*(.+?)\s*$", line)
+                if m:
+                    v = m.group(1).strip().strip('"').strip("'")
+                    out[k] = v
+
+    return out
+
+
+def vm101_read(paths):
+    script_lines = [
+        "set -eu",
+        "for f in " + " ".join("'" + p.replace("'", "'\"'\"'") + "'" for p in paths) + "; do",
+        "  echo __BEGIN_FILE__:$f",
+        "  if [ -f \"$f\" ]; then",
+        "    wc -l < \"$f\" | sed 's/^/__LINES__:/'",
+        "    sed -n '1,500p' \"$f\" | sed -E 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g'",
+        "  else",
+        "    echo __MISSING__",
+        "  fi",
+        "  echo __END_FILE__:$f",
+        "done",
+    ]
+    script = "\n".join(script_lines) + "\n"
+
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        PVE,
+        f"ssh -i {PVE_KEY} -o BatchMode=yes -o ConnectTimeout=8 root@{VM101} 'sh -s'",
+    ]
+
+    p = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    if p.returncode != 0:
+        print(p.stdout, end="")
+        print(p.stderr, end="", file=sys.stderr)
+        raise SystemExit(p.returncode)
+
+    files = {}
+    current = None
+    buf = []
+    for line in p.stdout.splitlines():
+        if line.startswith("__BEGIN_FILE__:"):
+            current = line.split(":", 1)[1]
+            buf = []
+            continue
+        if line.startswith("__END_FILE__:"):
+            end_path = line.split(":", 1)[1]
+            files[end_path] = "\n".join(buf) + ("\n" if buf else "")
+            current = None
+            buf = []
+            continue
+        if current is not None:
+            buf.append(line)
+
+    return files
+
+
+def split_tsv(text: str):
+    lines = []
+    line_count = None
+    missing = False
+
+    for line in text.splitlines():
+        if line.startswith("__LINES__:"):
+            try:
+                line_count = int(line.split(":", 1)[1])
+            except Exception:
+                line_count = None
+            continue
+        if line == "__MISSING__":
+            missing = True
+            continue
+        if line.strip():
+            lines.append(line)
+
+    if missing:
+        return line_count, []
+
+    if not lines:
+        return line_count, []
+
+    reader = csv.DictReader(StringIO("\n".join(lines) + "\n"), delimiter="\t")
+    rows = []
+    for row in reader:
+        rows.append({(k or "").strip(): (v or "").strip() for k, v in row.items()})
+    return line_count, rows
+
+
+def pick(row, *names):
+    lower = {k.lower(): v for k, v in row.items()}
+    for name in names:
+        v = lower.get(name.lower())
+        if v:
+            return v
+    return ""
+
+
+def basename(path: str) -> str:
+    if not path:
+        return ""
+    return path.rstrip("/").split("/")[-1]
+
+
+def sanitize_path(path: str) -> str:
+    if not path:
+        return ""
+    return basename(path)
+
+
+sources = parse_hmn_sources(EGRESS_YML.read_text())
+
+candidate = sources.get("candidate_source", "/root/hmn/cache/ok-awg1-strict-foreign-latest.tsv")
+selected = sources.get("selected_source", "/root/hmn/cache/selected-awg1-latest.tsv")
+fallback = sources.get("fallback_candidate_source", "/root/hmn/cache/ok-awg1-strict-all-latest.tsv")
+quarantine = sources.get("quarantine_source", "/root/hmn/cache/quarantine-awg1-latest.tsv")
+
+paths = [candidate, selected, fallback, quarantine]
+files = vm101_read(paths)
+
+parsed = {}
+for path in paths:
+    line_count, rows = split_tsv(files.get(path, ""))
+    parsed[path] = {"line_count": line_count, "rows": rows}
+
+selected_eps = set()
+selected_files = set()
+for row in parsed[selected]["rows"]:
+    ep = pick(row, "endpoint", "Endpoint")
+    fn = pick(row, "file", "config", "config_path", "path")
+    if ep:
+        selected_eps.add(ep)
+    if fn:
+        selected_files.add(basename(fn))
+
+quarantine_eps = set()
+quarantine_files = set()
+for row in parsed[quarantine]["rows"]:
+    ep = pick(row, "endpoint", "Endpoint")
+    fn = pick(row, "file", "config", "config_path", "path")
+    if ep:
+        quarantine_eps.add(ep)
+    if fn:
+        quarantine_files.add(basename(fn))
+
+header("HMN CANDIDATE SOURCES")
+print(f"INSTANCE={INSTANCE}")
+print(f"MODE=READ_ONLY")
+print(f"REMOTE_CHANGES=NO")
+print()
+for name, path in [
+    ("candidate_source", candidate),
+    ("selected_source", selected),
+    ("fallback_candidate_source", fallback),
+    ("quarantine_source", quarantine),
+]:
+    info = parsed[path]
+    print(f"{name:<28} {path:<62} lines={info['line_count']} rows={len(info['rows'])}")
+
+header("SELECTED SOURCE SUMMARY")
+for idx, row in enumerate(parsed[selected]["rows"], 1):
+    slot = pick(row, "slot", "id", "name")
+    ep = pick(row, "endpoint")
+    avg = pick(row, "avg_ms", "avg", "rtt", "latency", "ping_rtt_avg")
+    fn = sanitize_path(pick(row, "file", "config", "config_path", "path"))
+    country = pick(row, "country", "Country")
+    city = pick(row, "city", "City")
+    print(f"{idx:02d} slot={slot:<10} endpoint={ep:<28} avg={avg:<8} country={country:<12} city={city:<18} file={fn}")
+
+header("PRIMARY CANDIDATES")
+rows = parsed[candidate]["rows"]
+print(f"{'rank':<5} {'endpoint':<28} {'avg':<8} {'selected':<9} {'quarantine':<10} {'country':<12} {'city':<18} file")
+for idx, row in enumerate(rows, 1):
+    ep = pick(row, "endpoint")
+    avg = pick(row, "avg_ms", "avg", "rtt", "latency", "ping_rtt_avg")
+    fn_raw = pick(row, "file", "config", "config_path", "path")
+    fn = sanitize_path(fn_raw)
+    country = pick(row, "country", "Country")
+    city = pick(row, "city", "City")
+
+    is_selected = "yes" if (ep and ep in selected_eps) or (fn and fn in selected_files) else "no"
+    is_quar = "yes" if (ep and ep in quarantine_eps) or (fn and fn in quarantine_files) else "no"
+
+    print(f"{idx:<5} {ep:<28} {avg:<8} {is_selected:<9} {is_quar:<10} {country:<12} {city:<18} {fn}")
+
+header("FALLBACK CANDIDATE SUMMARY")
+print(f"fallback_rows={len(parsed[fallback]['rows'])}")
+print(f"quarantine_rows={len(parsed[quarantine]['rows'])}")
+
+header("SLOT FILL PROPOSAL, READ-ONLY")
+available = []
+for row in rows:
+    ep = pick(row, "endpoint")
+    fn = sanitize_path(pick(row, "file", "config", "config_path", "path"))
+    if (ep and ep in quarantine_eps) or (fn and fn in quarantine_files):
+        continue
+    available.append(row)
+
+for slot_no in range(1, 6):
+    if slot_no <= len(available):
+        row = available[slot_no - 1]
+        ep = pick(row, "endpoint")
+        avg = pick(row, "avg_ms", "avg", "rtt", "latency", "ping_rtt_avg")
+        fn = sanitize_path(pick(row, "file", "config", "config_path", "path"))
+        print(f"hmn_slot_{slot_no} iface=vpn{slot_no} table={200+slot_no} fwmark=0x20{slot_no} candidate_endpoint={ep} avg={avg} file={fn}")
+    else:
+        print(f"hmn_slot_{slot_no} iface=vpn{slot_no} table={200+slot_no} fwmark=0x20{slot_no} candidate_endpoint=NONE")
+
+header("ASSESSMENT")
+print("No changes applied.")
+print("This output is metadata-only. It does not publish raw configs, private keys, or HMN access code.")
+print("Next: STEP_030E can create the provider adapter skeleton using these TSV sources.")

@@ -1,0 +1,20 @@
+#!/bin/sh
+set -eu
+
+LABEL="${1:-context}"
+TS="$(date +%Y%m%d-%H%M%S)"
+BASE="/opt/router-ops"
+OUT="$BASE/captures/${TS}_${LABEL}_context"
+ARCHIVE="$OUT.safe.tar.gz"
+
+mkdir -p "$OUT"
+
+tar -C "$BASE" -czf "$ARCHIVE" \
+  --exclude='captures/*/raw' \
+  --exclude='*.tar.gz' \
+  --exclude='*/secrets/*' \
+  --exclude='*.env' \
+  product instances inventory status state bin
+
+echo "CONTEXT_ARCHIVE=$ARCHIVE"
+ls -lh "$ARCHIVE"

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+source "${ROUTER_PUBLICATION_POLICY_LIB:-$BASE/lib/router-publication-policy.sh}"
+[[ $# -ge 1 ]] || { echo RESULT=STOP_PUBLIC_SAFE_PAYLOAD_USAGE; exit 2; }
+DEST="$1"; shift
+(( $# % 2 == 0 )) || { echo RESULT=STOP_PUBLIC_SAFE_PAYLOAD_PAIR_COUNT; exit 2; }
+rm -rf "$DEST"; mkdir -p "$DEST"; chmod 700 "$DEST"
+while (( $# > 0 )); do
+  SRC="$1"; OUT="$2"; shift 2
+  [[ -f "$SRC" ]] || continue
+  [[ "$OUT" == "$(basename "$OUT")" && -n "$OUT" ]] || { echo RESULT=STOP_PUBLIC_SAFE_PAYLOAD_INVALID_BASENAME; echo "BASENAME=$OUT"; exit 3; }
+  router_publication_name_allowed "$OUT" || { echo RESULT=STOP_PUBLIC_SAFE_PAYLOAD_SUSPICIOUS_BASENAME; echo "BASENAME=$OUT"; exit 3; }
+  [[ ! -e "$DEST/$OUT" ]] || { echo RESULT=STOP_PUBLIC_SAFE_PAYLOAD_DUPLICATE_BASENAME; echo "BASENAME=$OUT"; exit 3; }
+  cp -a "$SRC" "$DEST/$OUT"; chmod 644 "$DEST/$OUT"
+done
+echo RESULT=PASS_PUBLIC_SAFE_PAYLOAD_BUILD
+echo "DEST=$DEST"
+echo "FILE_COUNT=$(find "$DEST" -maxdepth 1 -type f -printf . | wc -c)"

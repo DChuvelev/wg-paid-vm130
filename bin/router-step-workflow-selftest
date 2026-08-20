@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+LIB="${ROUTER_STEP_WORKFLOW_LIB_UNDER_TEST:-/opt/router-ops/lib/router-step-workflow.sh}"
+source "$LIB"
+WORK="$(mktemp -d /tmp/router-step-workflow-selftest.XXXXXX)"
+trap 'rm -rf "$WORK"' EXIT
+
+router_step_workflow_init "$WORK/current.env" "$WORK/events.tsv" transfer core publication http
+[[ "$(router_step_first_incomplete)" == transfer ]]
+router_step_phase_begin transfer
+router_step_phase_complete transfer
+[[ "$(router_step_first_incomplete)" == core ]]
+router_step_phase_begin core
+router_step_phase_complete core
+router_step_phase_skip publication synthetic_salvage
+[[ "$(router_step_first_incomplete)" == http ]]
+router_step_phase_begin http
+router_step_phase_complete http
+router_step_workflow_mark_complete
+router_step_workflow_is_complete
+
+set +e
+late="$(router_step_error_classification STOP_SYNTHETIC complete 999 1 'false command --arg value' VM101 true not_allowed none inspect_log)"
+late_rc=$?
+set -e
+[[ "$late_rc" -eq 0 ]]
+grep -qx RESULT=PASS_WORKFLOW_ALREADY_COMPLETE <<<"$late"
+grep -qx LATE_ERROR_AFTER_COMPLETE=true <<<"$late"
+grep -q '^LATE_ERROR_COMMAND=' <<<"$late"
+
+router_step_workflow_init "$WORK/current2.env" "$WORK/events2.tsv" preflight apply
+set +e
+stop="$(router_step_error_classification STOP_TEST apply 77 23 'cat /vm101/path' VM101 false completed /tmp/latest.zip inspect_remote_ack)"
+stop_rc=$?
+set -e
+[[ "$stop_rc" -eq 1 ]]
+grep -qx STOP_MACHINE_OWNER=VM101 <<<"$stop"
+grep -q '^STOP_COMMAND=' <<<"$stop"
+grep -qx CORE_CHANGE_COMPLETE=false <<<"$stop"
+grep -qx ROLLBACK_STATUS=completed <<<"$stop"
+grep -qx LATEST_ARCHIVE=/tmp/latest.zip <<<"$stop"
+[[ "$(wc -l < "$WORK/events.tsv")" -ge 8 ]]
+echo RESULT=PASS_ROUTER_STEP_WORKFLOW_SELFTEST

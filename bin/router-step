@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+STEPS="${ROUTER_OPS_STEPS:-$BASE/steps}"
+STEP_RUNS="${ROUTER_OPS_STEP_RUNS:-$BASE/step-runs}"
+
+usage() {
+  cat >&2 <<USAGE
+Usage:
+  router-step list
+  router-step <step-name> [args...]
+
+Examples:
+  router-step list
+  router-step ops/base-check
+  router-step pve/status
+  router-step pve/status 121
+  router-step pve/snapshot 121 BEFORE_CHANGE "before risky change"
+  router-step pve/listsnapshots 130
+  router-step wg-access/logs 100
+USAGE
+  exit 2
+}
+
+list_steps() {
+  find "$STEPS" -type f -name '*.sh' | sort | sed "s#^$STEPS/##; s#\\.sh\$##"
+}
+
+[ "$#" -ge 1 ] || usage
+
+step="$1"
+shift || true
+
+if [ "$step" = "list" ]; then
+  list_steps
+  exit 0
+fi
+
+case "$step" in
+  /*|*..*|*.sh)
+    echo "Invalid step name: $step" >&2
+    exit 2
+    ;;
+esac
+
+script="$STEPS/$step.sh"
+
+if [ ! -f "$script" ]; then
+  echo "Unknown step: $step" >&2
+  echo >&2
+  echo "Known steps:" >&2
+  list_steps >&2 || true
+  exit 1
+fi
+
+if [ ! -x "$script" ]; then
+  echo "Step is not executable: $script" >&2
+  exit 1
+fi
+
+safe_step="$(echo "$step" | sed -E 's#[^A-Za-z0-9_.-]+#_#g')"
+ts="$(date '+%Y%m%d_%H%M%S')"
+run_dir="$STEP_RUNS/${ts}_${safe_step}"
+mkdir -p "$run_dir"
+
+log="$run_dir/step.log"
+report="$run_dir/report.md"
+
+set +e
+(
+  echo "# router-step report"
+  echo
+  echo "- time: $(date -Is)"
+  echo "- step: $step"
+  echo "- script: $script"
+  echo "- args: $*"
+  echo "- run_dir: $run_dir"
+  echo
+  echo "## output"
+  echo
+  echo '```text'
+  "$script" "$@"
+  rc="$?"
+  echo '```'
+  echo
+  echo "- exit_code: $rc"
+  exit "$rc"
+) 2>&1 | tee "$report" "$log"
+rc="${PIPESTATUS[0]}"
+set -e
+
+exit "$rc"

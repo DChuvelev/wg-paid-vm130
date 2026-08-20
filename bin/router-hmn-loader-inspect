@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+import subprocess
+import sys
+
+INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "mgts-main"
+
+PVE = "pve-mgts"
+PVE_KEY = "/root/.ssh/pve_to_openwrt_mgts_ed25519"
+VM101 = "10.71.100.2"
+
+
+def header(title):
+    print()
+    print("################################################################")
+    print(f"### {title}")
+    print("################################################################")
+    print()
+
+
+def vm101(script):
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        PVE,
+        f"ssh -i {PVE_KEY} -o BatchMode=yes -o ConnectTimeout=8 root@{VM101} 'sh -s'",
+    ]
+    p = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    if p.stdout:
+        print(p.stdout, end="")
+    if p.stderr:
+        print(p.stderr, end="", file=sys.stderr)
+    print(f"\nrc={p.returncode}")
+    return p.returncode
+
+
+header("HMN LOADER INSPECT NO-NL")
+print(f"INSTANCE={INSTANCE}")
+print("MODE=READ_ONLY")
+print("REMOTE_CHANGES=NO")
+
+header("REMOTE TOOL CHECK")
+vm101(r'''
+for c in awk sed grep uci wg ifup ifdown sha256sum; do
+  printf "%-12s " "$c"
+  command -v "$c" || true
+done
+''')
+
+header("SCRIPT INVENTORY")
+vm101(r'''
+for f in \
+  /root/hmn/hmn-load-vpn-test.sh \
+  /root/hmn/hmn-load-vpn-user.sh \
+  /root/hmn/hmn-refill-slot.sh \
+  /root/hmn/hmn-apply-selected.sh \
+  /root/hmn/hmn-plan-selected.sh \
+  /root/hmn/hmn-vpn-user-override.sh \
+  /usr/bin/vpn-egress-manager.sh
+do
+  echo "--- $f ---"
+  if [ -f "$f" ]; then
+    ls -l "$f"
+    sha256sum "$f" | sed 's/^/sha256 /'
+  else
+    echo "MISSING"
+  fi
+done
+''')
+
+header("SANITIZED FULL LOADER CODE")
+vm101(r'''
+sanitize_file() {
+  f="$1"
+  echo
+  echo "### FILE $f"
+  if [ -f "$f" ]; then
+    awk '{printf "%5d\t%s\n", NR, $0}' "$f" \
+      | sed -E \
+        -e 's#(PrivateKey|private_key|private-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PRIVATE_KEY]#Ig' \
+        -e 's#(PresharedKey|preshared_key|preshared-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PSK]#Ig' \
+        -e 's#(PublicKey|public_key|public-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PUBLIC_KEY]#Ig' \
+        -e 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g' \
+      | sed -n '1,320p'
+  else
+    echo "MISSING"
+  fi
+}
+
+for f in \
+  /root/hmn/hmn-load-vpn-test.sh \
+  /root/hmn/hmn-load-vpn-user.sh \
+  /root/hmn/hmn-refill-slot.sh \
+  /root/hmn/hmn-apply-selected.sh \
+  /root/hmn/hmn-plan-selected.sh
+do
+  sanitize_file "$f"
+done
+''')
+
+header("LEGACY MANAGER RELEVANT CODE")
+vm101(r'''
+f=/usr/bin/vpn-egress-manager.sh
+echo "### FILE $f"
+if [ -f "$f" ]; then
+  awk '{printf "%5d\t%s\n", NR, $0}' "$f" \
+    | grep -Ei 'vpn1|vpn2|vpn3|vpn4|vpn5|vpn_user|wg|wireguard|amnezia|awg|uci|ifup|ifdown|route|table|rule|fwmark|endpoint|private|preshared|peer|config|hmn|hot|cold|primary|fallback|force' \
+    | sed -E \
+      -e 's#(PrivateKey|private_key|private-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PRIVATE_KEY]#Ig' \
+      -e 's#(PresharedKey|preshared_key|preshared-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PSK]#Ig' \
+      -e 's#(PublicKey|public_key|public-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PUBLIC_KEY]#Ig' \
+      -e 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g' \
+    | sed -n '1,360p'
+else
+  echo "MISSING"
+fi
+''')
+
+header("LOADER MECHANISM GREP")
+vm101(r'''
+echo "=== uci/ifup/ifdown/wg parsing lines ==="
+grep -RniE 'uci (set|add|delete|commit)|ifup|ifdown|wg set|wg show|amneziawg|wireguard_|PrivateKey|PresharedKey|PublicKey|Address|Endpoint|AllowedIPs|PersistentKeepalive|Jc|Jmin|Jmax|S1|S2|H1|H2|H3|H4' \
+  /root/hmn/hmn-load-vpn-test.sh \
+  /root/hmn/hmn-load-vpn-user.sh \
+  /root/hmn/hmn-refill-slot.sh \
+  /root/hmn/hmn-apply-selected.sh \
+  /root/hmn/hmn-plan-selected.sh \
+  /usr/bin/vpn-egress-manager.sh 2>/dev/null \
+  | sed -E \
+    -e 's#(PrivateKey|private_key|private-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PRIVATE_KEY]#Ig' \
+    -e 's#(PresharedKey|preshared_key|preshared-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PSK]#Ig' \
+    -e 's#(PublicKey|public_key|public-key)([[:space:]]*=[[:space:]]*)[^[:space:]]+#\1\2[REDACTED_PUBLIC_KEY]#Ig' \
+    -e 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g' \
+  | sed -n '1,360p'
+''')
+
+header("CURRENT SAFE STATE")
+vm101(r'''
+echo "=== interfaces ==="
+ip -br addr
+echo
+echo "=== rules ==="
+ip rule
+echo
+echo "=== tables 200-205 ==="
+for t in 200 201 202 203 204 205; do
+  echo "TABLE $t"
+  ip route show table "$t" 2>/dev/null || true
+done
+echo
+echo "=== firewall vpn_out ==="
+uci show firewall | grep -E 'vpn_out|vpn_in|vpn1|vpn2|vpn3|vpn4|vpn5|vpn_user|vpn_test|forwarding' || true
+echo
+echo "=== network safe fields ==="
+for i in vpn1 vpn2 vpn3 vpn4 vpn5 vpn_user vpn_test; do
+  echo
+  echo "### network.$i"
+  for k in proto auto disabled addresses mtu hmn_role hmn_endpoint hmn_source hmn_loaded_at hmn_id hmn_country hmn_city table fwmark metric; do
+    v="$(uci -q get network.$i.$k 2>/dev/null || true)"
+    [ -n "$v" ] && echo "$k=$v"
+  done
+done
+''')
+
+header("ASSESSMENT")
+print("No changes applied.")
+print("This second inspect avoids nl and should include the actual sanitized loader code.")

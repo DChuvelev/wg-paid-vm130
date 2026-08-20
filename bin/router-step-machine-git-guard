@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import pathlib
+import re
+import sys
+
+p=argparse.ArgumentParser(description="Guard Machine Git count contract")
+p.add_argument("--step-code", action="append", default=[])
+p.add_argument("--facts-json", action="append", default=[])
+p.add_argument("--published-facts-json")
+a=p.parse_args()
+errors=[]
+
+for raw in a.step_code:
+    path=pathlib.Path(raw)
+    text=path.read_text(encoding="utf-8", errors="replace")
+    lines=text.splitlines()
+    for i,line in enumerate(lines):
+        if "ls-tree" not in line:
+            continue
+        window="\n".join(lines[max(0,i-2):min(len(lines),i+5)])
+        if "LEGACY_FIXTURE_ONLY" in window:
+            continue
+        if "--name-only" in window and "--full-tree" not in window:
+            errors.append(f"{path}:{i+1}: unsafe ls-tree count without --full-tree")
+
+published_count=None
+if a.published_facts_json:
+    pub=json.loads(pathlib.Path(a.published_facts_json).read_text(encoding="utf-8"))
+    for key in ("file_count","git_tree_file_count","published_archive_file_count"):
+        if isinstance(pub.get(key), int):
+            published_count=pub[key]
+            break
+    if published_count is None and isinstance(pub.get("machine_git"),dict):
+        for key in ("git_tree_file_count","published_archive_file_count"):
+            if isinstance(pub["machine_git"].get(key), int):
+                published_count=pub["machine_git"][key]
+                break
+
+for raw in a.facts_json:
+    path=pathlib.Path(raw)
+    data=json.loads(path.read_text(encoding="utf-8"))
+    def walk(obj, where="$"):
+        if isinstance(obj,dict):
+            if "tracked_file_count" in obj:
+                errors.append(f"{path}:{where}: ambiguous field tracked_file_count is forbidden")
+            if "changed_files" in obj and "changed_file_count" in obj:
+                if isinstance(obj["changed_files"],list) and isinstance(obj["changed_file_count"],int):
+                    if len(obj["changed_files"]) != obj["changed_file_count"]:
+                        errors.append(f"{path}:{where}: changed_file_count does not match changed_files")
+            if "git_tree_file_count" in obj and "published_archive_file_count" in obj:
+                if obj["git_tree_file_count"] != obj["published_archive_file_count"]:
+                    errors.append(f"{path}:{where}: tree/archive count mismatch")
+            if published_count is not None and "git_tree_file_count" in obj:
+                if obj["git_tree_file_count"] != published_count:
+                    errors.append(f"{path}:{where}: git_tree_file_count differs from published facts")
+            for k,v in obj.items(): walk(v, f"{where}.{k}")
+        elif isinstance(obj,list):
+            for n,v in enumerate(obj): walk(v, f"{where}[{n}]")
+    walk(data)
+
+if errors:
+    for e in errors: print(f"GUARD_ERROR={e}")
+    print("MACHINE_GIT_COUNT_CONTRACT_PASS=false")
+    sys.exit(1)
+print("MACHINE_GIT_COUNT_CONTRACT_PASS=true")

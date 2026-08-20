@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+INV="${ROUTER_OPS_INVENTORY:-$BASE/inventory.tsv}"
+RUNS="${ROUTER_OPS_RUNS:-$BASE/runs}"
+KEY="${ROUTER_OPS_KEY:-/home/ops/.ssh/router_ops_ed25519}"
+TIMEOUT="${ROUTER_OPS_TIMEOUT:-120}"
+
+usage() {
+  cat >&2 <<USAGE
+Usage:
+  router-run <target-alias> '<command>'
+  ROUTER_OPS_TIMEOUT=300 router-run <target-alias> '<command>'
+
+Examples:
+  router-run local 'uname -a; date'
+  router-run vm100 'ip route; ip rule'
+  router-run vm101 'wg show; ip route show table 200'
+  router-run vm103 'docker ps; systemctl status docker --no-pager'
+USAGE
+  exit 2
+}
+
+[ "$#" -ge 2 ] || usage
+
+target="$1"
+shift
+cmd="$*"
+
+[ -f "$INV" ] || { echo "Inventory not found: $INV" >&2; exit 1; }
+[ -f "$KEY" ] || { echo "SSH key not found: $KEY" >&2; exit 1; }
+
+line="$(awk -F'|' -v t="$target" '
+  $0 !~ /^[[:space:]]*#/ && $1 == t { print; exit }
+' "$INV")"
+
+if [ -z "$line" ]; then
+  echo "Unknown target: $target" >&2
+  echo "Known targets:" >&2
+  "$BASE/bin/router-targets" >&2 || true
+  exit 1
+fi
+
+IFS='|' read -r alias host user port notes <<< "$line"
+
+safe_target="$(echo "$target" | sed -E 's/[^A-Za-z0-9_.-]+/_/g')"
+ts="$(date '+%Y%m%d_%H%M%S')"
+run_dir="$RUNS/${ts}_${safe_target}"
+mkdir -p "$run_dir"
+
+command_file="$run_dir/command.sh"
+stdout_raw="$run_dir/stdout.raw.log"
+stderr_raw="$run_dir/stderr.raw.log"
+stdout_log="$run_dir/stdout.log"
+stderr_log="$run_dir/stderr.log"
+report="$run_dir/report.md"
+
+printf '%s\n' "$cmd" > "$command_file"
+
+mask_file() {
+  sed -E \
+    -e "s#(PrivateKey[[:space:]]*=[[:space:]]*)[^[:space:]]+#\1***MASKED***#Ig" \
+    -e "s#((password|passwd|token|secret|api[_-]?key)[[:space:]]*[:=][[:space:]]*)[^[:space:]]+#\1***MASKED***#Ig" \
+    -e "s#([._-]?private[_-]?key[[:space:]]*=[[:space:]]*)'[^']*'#\1'***MASKED***'#Ig" \
+    -e "s#([._-]?private[_-]?key[[:space:]]*=[[:space:]]*)\"[^\"]*\"#\1\"***MASKED***\"#Ig" \
+    -e "s#([._-]?private[_-]?key[[:space:]]*=[[:space:]]*)[^[:space:]]+#\1***MASKED***#Ig" \
+    -e "s#(WG_SERVER_PUBLIC_KEY[[:space:]]*=[[:space:]]*)[^[:space:]]+#\1***MASKED***#Ig" \
+    -e "s#(REMOTE_SSH_KEY[[:space:]]*=[[:space:]]*)[^[:space:]]+#\1***MASKED***#Ig" \
+    "$1" > "$2"
+}
+
+set +e
+timeout "$TIMEOUT" ssh \
+  -i "$KEY" \
+  -p "$port" \
+  -o BatchMode=yes \
+  -o ConnectTimeout=8 \
+  -o ServerAliveInterval=10 \
+  -o ServerAliveCountMax=2 \
+  -o StrictHostKeyChecking=accept-new \
+  "$user@$host" \
+  'sh -s' < "$command_file" > "$stdout_raw" 2> "$stderr_raw"
+rc="$?"
+set -e
+
+mask_file "$stdout_raw" "$stdout_log"
+mask_file "$stderr_raw" "$stderr_log"
+
+{
+  echo "# router-run report"
+  echo
+  echo "- time: $(date -Is)"
+  echo "- target: $target"
+  echo "- host: $host"
+  echo "- user: $user"
+  echo "- port: $port"
+  echo "- notes: ${notes:-}"
+  echo "- timeout: ${TIMEOUT}s"
+  echo "- exit_code: $rc"
+  echo "- run_dir: $run_dir"
+  echo
+  echo "## command"
+  echo
+  echo '```sh'
+  cat "$command_file"
+  echo '```'
+  echo
+  echo "## stdout"
+  echo
+  echo '```text'
+  cat "$stdout_log"
+  echo '```'
+  echo
+  echo "## stderr"
+  echo
+  echo '```text'
+  cat "$stderr_log"
+  echo '```'
+} > "$report"
+
+cat "$report"
+
+exit "$rc"

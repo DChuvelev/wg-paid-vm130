@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import shlex
+import sys
+
+HEX64 = re.compile(r'^[0-9a-f]{64}$')
+
+class ContractError(Exception):
+    pass
+
+def sha(path: Path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+def load(root: Path):
+    path = root / 'release-info.json'
+    if not path.is_file():
+        raise ContractError('release_info_missing')
+    try:
+        info = json.loads(path.read_text(encoding='utf-8'))
+    except Exception as exc:
+        raise ContractError(f'release_info_invalid:{exc}')
+    return info
+
+def validate(root: Path, args):
+    info = load(root)
+    required = {
+        'schema': 'router-step-release-v1',
+        'step_id': root.name,
+        'workflow_contract_version': 2,
+        'canonical_zip_required': True,
+    }
+    for key, value in required.items():
+        if info.get(key) != value:
+            raise ContractError(f'{key}_mismatch:{info.get(key)!r}')
+    for key in ('revision', 'worker_entry', 'exact_worker_fixture', 'target_package_path', 'target_package_sha256', 'expected_installer_sha256'):
+        if not isinstance(info.get(key), str) or not info[key]:
+            raise ContractError(f'{key}_missing')
+    installer = root / 'install.sh'
+    if not installer.is_file():
+        raise ContractError('installer_missing')
+    installer_sha = sha(installer)
+    if info['expected_installer_sha256'] != installer_sha:
+        raise ContractError('installer_sha_release_mismatch')
+    installer_ref = root / 'installer.sha256'
+    if not installer_ref.is_file() or installer_ref.read_text().strip() != installer_sha:
+        raise ContractError('installer_sha_file_mismatch')
+    package = root / info['target_package_path']
+    if not package.is_file():
+        raise ContractError('target_package_missing')
+    target_sha = sha(package)
+    if info['target_package_sha256'] != target_sha or not HEX64.fullmatch(target_sha):
+        raise ContractError('target_package_sha_release_mismatch')
+    ref = root / 'reference/target-package.sha256'
+    expected_ref = f"{target_sha}  {info['target_package_path']}"
+    if not ref.is_file() or ref.read_text(encoding='utf-8').strip() != expected_ref:
+        raise ContractError('target_package_reference_mismatch')
+    for key in ('worker_entry', 'exact_worker_fixture'):
+        path = root / info[key]
+        if not path.is_file():
+            raise ContractError(f'{key}_path_missing:{info[key]}')
+    mandatory = root / 'tests/mandatory.list'
+    if not mandatory.is_file():
+        raise ContractError('mandatory_list_missing')
+    listed = [x.strip() for x in mandatory.read_text().splitlines() if x.strip() and not x.lstrip().startswith('#')]
+    fixture_rel = info['exact_worker_fixture']
+    prefix = 'tests/'
+    fixture_name = fixture_rel[len(prefix):] if fixture_rel.startswith(prefix) else fixture_rel
+    if fixture_name not in listed:
+        raise ContractError('exact_worker_fixture_not_mandatory')
+    worker_text = (root / info['worker_entry']).read_text(encoding='utf-8', errors='replace')
+    installer_text = installer.read_text(encoding='utf-8', errors='replace')
+    if re.search(r'^\s*TARGET_PACKAGE_SHA256\s*=\s*["\']?[0-9a-f]{64}', worker_text, re.M):
+        raise ContractError('worker_target_sha_literal_forbidden')
+    if re.search(r'^\s*TARGET_PACKAGE_SHA256\s*=\s*["\']?[0-9a-f]{64}', installer_text, re.M):
+        raise ContractError('installer_target_sha_literal_forbidden')
+    if args.step and info['step_id'] != args.step:
+        raise ContractError('step_argument_mismatch')
+    if args.installer_sha and installer_sha != args.installer_sha:
+        raise ContractError('installer_argument_mismatch')
+    if args.target_sha and target_sha != args.target_sha:
+        raise ContractError('target_argument_mismatch')
+    return info, installer_sha, target_sha
+
+def verify_cmd(args):
+    root = Path(args.root).resolve()
+    info, installer_sha, target_sha = validate(root, args)
+    print('RESULT=PASS_ROUTER_RELEASE_CONTRACT_VERIFY')
+    print(f"STEP_ID={info['step_id']}")
+    print(f"REVISION={info['revision']}")
+    print(f'INSTALLER_SHA256={installer_sha}')
+    print(f'TARGET_PACKAGE_SHA256={target_sha}')
+    print(f"WORKER_ENTRY={info['worker_entry']}")
+    print(f"EXACT_WORKER_FIXTURE={info['exact_worker_fixture']}")
+
+def env_cmd(args):
+    root = Path(args.root).resolve()
+    info, installer_sha, target_sha = validate(root, args)
+    values = {
+        'ROUTER_RELEASE_STEP_ID': info['step_id'],
+        'ROUTER_RELEASE_REVISION': info['revision'],
+        'ROUTER_RELEASE_INSTALLER_SHA256': installer_sha,
+        'ROUTER_RELEASE_TARGET_PACKAGE_PATH': info['target_package_path'],
+        'ROUTER_RELEASE_TARGET_PACKAGE_SHA256': target_sha,
+        'ROUTER_RELEASE_WORKER_ENTRY': info['worker_entry'],
+        'ROUTER_RELEASE_EXACT_WORKER_FIXTURE': info['exact_worker_fixture'],
+    }
+    for key, value in values.items():
+        print(f'export {key}={shlex.quote(str(value))}')
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest='cmd', required=True)
+    for name, func in (('verify', verify_cmd), ('env', env_cmd)):
+        q = sub.add_parser(name)
+        q.add_argument('--root', required=True)
+        q.add_argument('--step')
+        q.add_argument('--installer-sha')
+        q.add_argument('--target-sha')
+        q.set_defaults(func=func)
+    args = p.parse_args()
+    try:
+        args.func(args)
+    except (ContractError, OSError) as exc:
+        print(f'RELEASE_CONTRACT_ERROR={exc}', file=sys.stderr)
+        print('RESULT=STOP_ROUTER_RELEASE_CONTRACT', file=sys.stderr)
+        raise SystemExit(62)
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,248 @@
+#!/usr/bin/env python3
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+INSTANCE = sys.argv[1] if len(sys.argv) > 1 else "mgts-main"
+
+BASE = Path("/opt/router-ops")
+INSTANCE_DIR = BASE / "instances" / INSTANCE
+EGRESS_YML = INSTANCE_DIR / "egress.yml"
+
+PVE = "pve-mgts"
+PVE_KEY = "/root/.ssh/pve_to_openwrt_mgts_ed25519"
+VM101 = "10.71.100.2"
+
+if not EGRESS_YML.exists():
+    print(f"ERROR: missing {EGRESS_YML}", file=sys.stderr)
+    sys.exit(1)
+
+
+def clean(value: str) -> str:
+    value = value.strip()
+    if value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    if value.startswith("'") and value.endswith("'"):
+        value = value[1:-1]
+    return value
+
+
+def parse_slots(text: str):
+    slots = []
+    in_slots = False
+    current = None
+
+    for line in text.splitlines():
+        if re.match(r"^\s*slots:\s*$", line):
+            in_slots = True
+            continue
+
+        if in_slots and re.match(r"^\s{2}[a-zA-Z_].*:", line) and not line.strip().startswith("- "):
+            if current:
+                slots.append(current)
+                current = None
+            break
+
+        if not in_slots:
+            continue
+
+        m = re.match(r"^\s*-\s*id:\s*(.+?)\s*$", line)
+        if m:
+            if current:
+                slots.append(current)
+            current = {"id": clean(m.group(1))}
+            continue
+
+        if current:
+            m = re.match(r"^\s*([a-zA-Z_]+):\s*(.+?)\s*$", line)
+            if m:
+                current[m.group(1)] = clean(m.group(2))
+
+    if current:
+        slots.append(current)
+
+    return slots
+
+
+def header(title: str) -> None:
+    print()
+    print("################################################################")
+    print(f"### {title}")
+    print("################################################################")
+    print()
+
+
+def vm101(script: str) -> int:
+    cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=10",
+        PVE,
+        f"ssh -i {PVE_KEY} -o BatchMode=yes -o ConnectTimeout=8 root@{VM101} 'sh -s'"
+    ]
+    p = subprocess.run(cmd, input=script, text=True, capture_output=True)
+    if p.stdout:
+        print(p.stdout, end="")
+    if p.stderr:
+        print(p.stderr, end="", file=sys.stderr)
+    print(f"\nrc={p.returncode}")
+    return p.returncode
+
+
+egress_text = EGRESS_YML.read_text()
+slots = parse_slots(egress_text)
+
+header("ROUTER EGRESS STATUS")
+print(f"INSTANCE={INSTANCE}")
+print(f"INSTANCE_DIR={INSTANCE_DIR}")
+print(f"EGRESS_YML={EGRESS_YML}")
+print("MODE=READ_ONLY")
+print("REMOTE_CHANGES=NO")
+
+header("EXPECTED PROFILE SLOTS")
+for s in slots:
+    print(
+        f"{s.get('id',''):<12} "
+        f"iface={s.get('iface',''):<6} "
+        f"table={s.get('table',''):<4} "
+        f"fwmark={s.get('fwmark',''):<6} "
+        f"provider={s.get('provider',''):<12} "
+        f"role={s.get('role',''):<8} "
+        f"weight={s.get('weight','')}"
+    )
+
+header("VM101 BASIC")
+vm101(r'''
+date
+uptime
+echo
+ip -br addr
+echo
+ip route | sed -n '1,80p'
+echo
+ip rule
+''')
+
+header("LEGACY AUTOMATION FREEZE CHECK")
+vm101(r'''
+echo "=== crontab ==="
+crontab -l 2>/dev/null || true
+echo
+echo "=== hotplug iface ==="
+ls -la /etc/hotplug.d/iface
+echo
+echo "=== disabled hotplug files ==="
+find /root/router-ops-disabled-hotplug -maxdepth 3 -type f 2>/dev/null | sort | sed -n '1,80p'
+echo
+echo "=== legacy processes ==="
+ps w | grep -E 'vpn-egress-manager|hmn-refresh|hmn-pool|hmn-vpn-user' | grep -v grep || true
+''')
+
+header("EGRESS INTERFACES SAFE SUMMARY")
+vm101(r'''
+for i in vpn1 vpn2 vpn3 vpn4 vpn5 vpn_user vpn_test; do
+  echo
+  echo "### IFACE $i"
+  echo "--- UCI safe fields ---"
+  for k in proto auto disabled addresses hmn_role hmn_endpoint hmn_source hmn_loaded_at hmn_id hmn_country hmn_city; do
+    v="$(uci -q get network.$i.$k 2>/dev/null || true)"
+    [ -n "$v" ] && echo "$k=$v"
+  done
+  echo "--- ip addr ---"
+  ip -br addr show dev "$i" 2>/dev/null || true
+  echo "--- wg public/endpoints/handshake/transfer ---"
+  wg show "$i" public-key 2>/dev/null | sed 's/^/public-key=/' || true
+  wg show "$i" endpoints 2>/dev/null | sed 's/^/endpoint /' || true
+  wg show "$i" latest-handshakes 2>/dev/null | sed 's/^/latest-handshake /' || true
+  wg show "$i" transfer 2>/dev/null | sed 's/^/transfer /' || true
+done
+''')
+
+header("FIREWALL VPN_OUT / FORWARDINGS")
+vm101(r'''
+echo "=== firewall vpn-related ==="
+uci show firewall | grep -E 'vpn_out|vpn_in|vpn1|vpn2|vpn3|vpn4|vpn5|vpn_user|vpn_test|forwarding' || true
+echo
+echo "=== nft vpn_out/direct snippets ==="
+nft list ruleset 2>/dev/null | grep -A8 -B4 -E 'vpn_out|vpn_in|vpn1|vpn2|vpn3|vpn4|vpn5|vpn_user|vpn_test' | sed -n '1,220p' || true
+''')
+
+header("ROUTING TABLES 200-205")
+vm101(r'''
+echo "=== ip rule ==="
+ip rule
+echo
+for t in 200 201 202 203 204 205; do
+  echo "=== table $t ==="
+  ip route show table "$t" 2>/dev/null || true
+done
+echo
+echo "=== /etc/iproute2/rt_tables tail ==="
+tail -n 80 /etc/iproute2/rt_tables 2>/dev/null || true
+''')
+
+header("HMN CACHE / POOL STATUS")
+vm101(r'''
+echo "=== key HMN cache files ==="
+for f in \
+  /root/hmn/cache/selected-awg1-latest.tsv \
+  /root/hmn/cache/working-awg1-latest.tsv \
+  /root/hmn/cache/ranked-awg1-latest.tsv \
+  /root/hmn/cache/ok-awg1-strict-latest.tsv \
+  /root/hmn/cache/ok-awg1-strict-all-latest.tsv \
+  /root/hmn/cache/ok-awg1-strict-foreign-latest.tsv \
+  /root/hmn/cache/fail-awg1-latest.tsv \
+  /root/hmn/cache/quarantine-awg1-latest.tsv \
+  /root/hmn/cache/wg-candidates-latest.tsv
+do
+  if [ -f "$f" ]; then
+    printf "%-62s lines=" "$f"
+    wc -l < "$f"
+  else
+    printf "%-62s MISSING\n" "$f"
+  fi
+done
+
+echo
+echo "=== selected-awg1-latest.tsv sample, sanitized-ish ==="
+if [ -f /root/hmn/cache/selected-awg1-latest.tsv ]; then
+  sed -n '1,20p' /root/hmn/cache/selected-awg1-latest.tsv | sed -E 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g'
+fi
+
+echo
+echo "=== config directory counts ==="
+for d in \
+  /root/hmn/configs/awg1/latest \
+  /root/hmn/configs/awg1 \
+  /root/hmn/cache
+do
+  echo "--- $d ---"
+  if [ -d "$d" ]; then
+    find "$d" -maxdepth 1 -type f | wc -l | sed 's/^/files=/'
+    find "$d" -maxdepth 1 -type f -name "*.conf" | wc -l | sed 's/^/conf_files=/'
+  else
+    echo "MISSING"
+  fi
+done
+
+echo
+echo "=== HMN scripts references to selected/latest/configs ==="
+grep -RniE 'selected-awg1-latest|working-awg1-latest|ok-awg1|configs/awg1|latest' \
+  /root/hmn/*.sh /usr/bin/vpn-egress-manager.sh 2>/dev/null \
+  | sed -E 's#([A-Za-z0-9+/=]{32,})#[REDACTED_LONG_TOKEN]#g' \
+  | sed -n '1,160p' || true
+''')
+
+header("READ-ONLY ASSESSMENT")
+print("No changes applied.")
+print()
+print("Known observations to verify from this status:")
+print("- expected future slots are vpn1..vpn5 with tables 201..205")
+print("- legacy runtime still uses table 200")
+print("- vpn1/vpn2 may still exist from legacy HMN")
+print("- vpn3/vpn4/vpn5 are expected to be absent/empty before apply")
+print("- if /root/hmn/configs/awg1/latest has 0 .conf files, egress.yml candidate_source must be adjusted before apply")
+print()
+print("Next step after review:")
+print("- STEP_030C: define provider adapter input source and read-only slot model")

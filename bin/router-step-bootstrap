@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+VERIFY_ONLY=false
+if [[ "${1:-}" == --verify-only ]]; then VERIFY_ONLY=true; shift; fi
+[[ "$#" -ge 3 && "$#" -le 4 ]] || { echo 'Usage: router-step-bootstrap [--verify-only] ZIP ZIP_SHA256 INSTALLER_SHA256 [TARGET_PACKAGE_SHA256]' >&2; exit 2; }
+ZIP="$1"; ZIP_SHA="$2"; INSTALL_SHA="$3"; TARGET_SHA="${4:-}"
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+GATE="${ROUTER_BUNDLE_GATE:-$BASE/bin/router-bundle-gate}"
+ZIP_TOOL="$BASE/bin/router-zip-contract"
+RELEASE_TOOL="$BASE/bin/router-release-contract"
+STEP="$(basename "$ZIP" .zip)"
+WORK="$(dirname "$ZIP")/.unpack-${STEP}-$$"
+EMERGENCY_HANDLED=false
+archive_current_latest() {
+  if [[ -r "$BASE/lib/router-step-workflow.sh" ]]; then
+    source "$BASE/lib/router-step-workflow.sh"
+    router_step_archive_latest_python "$BASE" /home/ops/incoming "$(date -u +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  fi
+}
+emergency_stop() {
+  local rc="$1" line="$2" command="$3"
+  trap - ERR
+  [[ "$EMERGENCY_HANDLED" == false ]] || exit "$rc"
+  EMERGENCY_HANDLED=true
+  set +e
+  echo RESULT=STOP_ROUTER_STEP_BOOTSTRAP
+  echo "STEP=$STEP"
+  echo "BOOTSTRAP_STOP_LINE=$line"
+  echo "BOOTSTRAP_STOP_RC=$rc"
+  printf 'BOOTSTRAP_STOP_COMMAND=%q\n' "$command"
+  echo "RETAINED_UNPACK_DIR=$WORK"
+  archive_current_latest
+  exit "$rc"
+}
+trap 'rc=$?; emergency_stop "$rc" "$LINENO" "$BASH_COMMAND"' ERR
+[[ -x "$ZIP_TOOL" && -x "$RELEASE_TOOL" ]]
+[[ -f "$ZIP" ]] || { echo RESULT=STOP_COPY_OR_TRANSFER_ERROR; echo COPY_VERIFY=FAIL; echo STEP_WAS_NOT_STARTED=true; exit 20; }
+echo '>>> verify ZIP'
+echo "$ZIP_SHA  $ZIP" | sha256sum -c -
+rm -rf "$WORK"; mkdir -p "$WORK"; chmod 700 "$WORK"
+"$ZIP_TOOL" verify --zip "$ZIP" --root "$STEP" --canonical
+"$ZIP_TOOL" extract --zip "$ZIP" --destination "$WORK" --root "$STEP" --canonical
+DIR="$WORK/$STEP"
+[[ -f "$DIR/install.sh" && -f "$DIR/manifest.sha256" && -f "$DIR/release-info.json" ]]
+(cd "$DIR" && sha256sum -c manifest.sha256)
+contract_version="$(python3 - "$DIR/release-info.json" <<'PYV'
+import json,sys
+print(int(json.load(open(sys.argv[1],encoding='utf-8')).get('workflow_contract_version') or 0))
+PYV
+)"
+if [[ "$contract_version" -ge 2 ]]; then
+  args=(verify --root "$DIR" --step "$STEP" --installer-sha "$INSTALL_SHA")
+  [[ -n "$TARGET_SHA" ]] && args+=(--target-sha "$TARGET_SHA")
+  "$RELEASE_TOOL" "${args[@]}"
+else
+  python3 - "$DIR/release-info.json" "$STEP" "$INSTALL_SHA" "$TARGET_SHA" <<'PYLEG'
+import json,sys
+p,step,ish,tsh=sys.argv[1:]
+x=json.load(open(p,encoding='utf-8')); assert x['step_id']==step; assert x['expected_installer_sha256']==ish
+if tsh: assert x.get('target_package_sha256')==tsh
+PYLEG
+fi
+if find "$DIR" \( -type d -name __pycache__ -o -type f \( -name '*.pyc' -o -name '*.pyo' \) \) -print -quit | grep -q .; then
+  echo RESULT=STOP_BUNDLE_PYTHON_BYTECODE_PRESENT; exit 22
+fi
+python3 - "$DIR" <<'PYCLASS' | while IFS=$'\t' read -r kind file; do
+import sys
+from pathlib import Path
+root=Path(sys.argv[1])
+for p in sorted(x for x in root.rglob('*') if x.is_file()):
+    first=p.open('rb').readline(256).decode('ascii','ignore').rstrip('\r\n')
+    kind={'#!/usr/bin/env bash':'bash','#!/bin/bash':'bash','#!/bin/sh':'sh','#!/bin/ash':'sh','#!/usr/bin/env python3':'python','#!/usr/bin/python3':'python'}.get(first)
+    if kind: print(f'{kind}\t{p}')
+PYCLASS
+  case "$kind" in
+    bash) bash -n "$file" ;;
+    sh) sh -n "$file" ;;
+    python) python3 - "$file" <<'PYCHECK'
+import sys
+from pathlib import Path
+p=Path(sys.argv[1]); compile(p.read_bytes(),str(p),'exec')
+PYCHECK
+      ;;
+  esac
+done
+BUNDLE_ZIP="$ZIP" EXPECTED_BUNDLE_SHA256="$ZIP_SHA" BUNDLE_ROOT="$DIR" "$GATE" "$DIR"
+echo MANIFEST_VERIFY=PASS
+echo SYNTAX_VERIFY=PASS
+echo FIXTURE_VERIFY=PASS
+echo COPY_VERIFY=PASS
+echo "STEP_SHA256=$INSTALL_SHA"
+if [[ "$VERIFY_ONLY" == true ]]; then echo RESULT=PASS_ROUTER_STEP_BOOTSTRAP_VERIFY_ONLY; rm -rf "$WORK"; exit 0; fi
+echo ">>> start $STEP"
+set +e
+BUNDLE_ZIP="$ZIP" EXPECTED_BUNDLE_SHA256="$ZIP_SHA" EXPECTED_INSTALLER_SHA256="$INSTALL_SHA" "$DIR/install.sh"
+rc=$?
+set -e
+echo "BOOTSTRAP_INSTALLER_RC=$rc"
+[[ "$rc" -eq 0 ]] && rm -rf "$WORK"
+trap - ERR
+exit "$rc"
