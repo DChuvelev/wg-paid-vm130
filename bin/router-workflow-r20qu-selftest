@@ -15,6 +15,7 @@ VM130	bash	bash,python3	busybox,zip
 PVE	bash	bash,qm	openwrt-paths-local
 VM100	posix-sh	busybox	bash,find-printf
 VM101	posix-sh	busybox,amneziawg	bash,find-printf
+VM103	bash	bash,caddy	openwrt-paths-local
 EOF
 router_target_matrix_validate "$OUT/matrix.tsv"
 
@@ -24,6 +25,7 @@ PVE	durable	true	/etc/pve
 VM100	durable	true	/etc/router-wgpay-selector.d
 VM101	runtime	false	/var/lib/router-egress-recovery
 VM101	optional	false	/var/lib/router-egress-recovery/generations/staging
+VM103	runtime	true	/etc/caddy
 EOF
 router_path_ownership_validate "$OUT/ownership.tsv"
 router_path_owner_assert "$OUT/ownership.tsv" VM101 /var/lib/router-egress-recovery > "$OUT/owner-pass.log"

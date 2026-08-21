@@ -57,7 +57,7 @@ for p,t in shell_files:
     remote=(p.parent.name=='scripts' and first in ('#!/bin/sh','#!/bin/ash'))
     if remote:
         head='\n'.join(t.splitlines()[:12])
-        if not re.search(r'^# ROUTER_SCRIPT_TARGET=(VM100|VM101|PVE)$',head,re.M):
+        if not re.search(r'^# ROUTER_SCRIPT_TARGET=(VM100|VM101|VM103|PVE)$',head,re.M):
             fail('remote_target_annotation_missing',str(p.relative_to(root)))
         for rx,code in remote_forbidden:
             if rx.search(t): fail(code,str(p.relative_to(root)))
@@ -120,9 +120,13 @@ if int(info.get('workflow_contract_version') or 0)>=1:
         for n,line in enumerate(text(matrix).splitlines(),1):
             if not line or line.lstrip().startswith('#'): continue
             cols=line.split('\t'); rows.append(cols)
-            if len(cols)!=4 or cols[0] not in ('VM130','PVE','VM100','VM101') or cols[1] not in ('bash','posix-sh'):
+            if len(cols)!=4 or cols[0] not in ('VM130','PVE','VM100','VM101','VM103') or cols[1] not in ('bash','posix-sh'):
                 fail('target_environment_matrix_invalid',f'{matrix.relative_to(root)}:{n}')
-        if sorted(r[0] for r in rows if len(r)==4)!=['PVE','VM100','VM101','VM130']:
+        required_targets=['PVE','VM100','VM101','VM130']
+        touched={str(x).upper() for x in (info.get('touched_machines') or [])}
+        if 'VM103' in touched:
+            required_targets.append('VM103')
+        if sorted(r[0] for r in rows if len(r)==4)!=sorted(required_targets):
             fail('target_environment_matrix_incomplete',str(matrix.relative_to(root)))
     if not ownership.is_file():
         fail('path_ownership_manifest_missing',str(ownership))
@@ -130,7 +134,7 @@ if int(info.get('workflow_contract_version') or 0)>=1:
         for n,line in enumerate(text(ownership).splitlines(),1):
             if not line or line.lstrip().startswith('#'): continue
             cols=line.split('\t')
-            if len(cols)!=4 or cols[0] not in ('VM130','PVE','VM100','VM101') or cols[1] not in ('durable','runtime','optional') or cols[2] not in ('true','false') or not cols[3].startswith('/'):
+            if len(cols)!=4 or cols[0] not in ('VM130','PVE','VM100','VM101','VM103') or cols[1] not in ('durable','runtime','optional') or cols[2] not in ('true','false') or not cols[3].startswith('/'):
                 fail('path_ownership_manifest_invalid',f'{ownership.relative_to(root)}:{n}')
             elif cols[1]=='optional' and cols[2]=='true':
                 fail('optional_path_mandatory',f'{ownership.relative_to(root)}:{n}')

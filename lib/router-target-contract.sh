@@ -7,7 +7,7 @@ router_target_matrix_validate() {
       BEGIN{ok=1}
       /^[[:space:]]*($|#)/{next}
       NF!=4{ok=0; next}
-      $1!~/^(VM130|PVE|VM100|VM101)$/{ok=0}
+      $1!~/^(VM130|PVE|VM100|VM101|VM103)$/{ok=0}
       $2!~/^(bash|posix-sh)$/{ok=0}
       seen[$1]++
       END{
@@ -24,7 +24,7 @@ router_path_ownership_validate() {
       BEGIN{ok=1}
       /^[[:space:]]*($|#)/{next}
       NF!=4{ok=0; next}
-      $1!~/^(VM130|PVE|VM100|VM101)$/{ok=0}
+      $1!~/^(VM130|PVE|VM100|VM101|VM103)$/{ok=0}
       $2!~/^(durable|runtime|optional)$/{ok=0}
       $3!~/^(true|false)$/{ok=0}
       $4!~/^\//{ok=0}
