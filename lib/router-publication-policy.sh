@@ -15,7 +15,8 @@ router_publication_classify() {
 ' vm101 '*_vm101_git_source_*' ;;
       vm121_git_source_*) printf '%s	%s
 ' vm121 '*_vm121_git_source_*' ;;
-      vm130_git_source_*) printf '%s\t%s\n' vm130-source '*_vm130_*source_*' ;;
+      vm130_git_source_*) printf '%s	%s
+' vm130-source '*_vm130_git_source_*' ;;
       local_architecture_plan_vm101_autonomous_hmn_recovery*) printf '%s	%s
 ' local-m07-plan '*_local_architecture_plan_vm101_autonomous_hmn_recovery*' ;;
       global_project_plan_wg_paid*) printf '%s	%s
@@ -27,7 +28,7 @@ router_publication_classify() {
       vm101_methods_*) printf '%s	%s
 ' vm101-methods '*_vm101_methods_*' ;;
       vm130_router_ops_source_snapshot*) printf '%s	%s
-' vm130-source '*_vm130_*source_*' ;;
+' vm130-source '*_vm130_router_ops_source_snapshot*' ;;
       project_source_post_*) printf '%s	%s
 ' project-source-post '*_project_source_post_*' ;;
       step*|*_step*) printf '%s	%s

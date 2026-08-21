@@ -130,6 +130,8 @@ done
 mapfile -t CURRENT_MATCHES < <(
     if [[ "$KIND" == access-map ]]; then
         find "$LATEST" -mindepth 1 -maxdepth 1 -type d \( -name '*_xs_map_*' -o -name '*_access_map_*' \) -printf '%f\n'
+    elif [[ "$KIND" == vm130-source ]]; then
+        find "$LATEST" -mindepth 1 -maxdepth 1 -type d \( -name '*_vm130_git_source_*' -o -name '*_vm130_router_ops_source_snapshot*' \) -printf '%f\n'
     else
         find "$LATEST" -mindepth 1 -maxdepth 1 -type d -name "$MATCH" -printf '%f\n'
     fi | LC_ALL=C sort
