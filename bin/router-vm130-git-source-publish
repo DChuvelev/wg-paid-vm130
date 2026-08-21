@@ -5,7 +5,7 @@ umask 077
 MODE="${1:---check}"
 BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
 PUBLIC_BASE="${ROUTER_PUBLIC_BASE_URL:-https://reports.secret-studio.ru}"; PUBLIC_BASE="${PUBLIC_BASE%/}"
-REPOSITORY_URL="file:///opt/router-ops/state/source-remotes/wg-paid-vm130.git"
+REPOSITORY_URL="https://github.com/DChuvelev/wg-paid-vm130.git"
 REPO_DIR="$BASE/state/source-repositories/wg-paid-vm130"
 STATE_FILE="$BASE/state/current-vm130-git-source.env"
 PUBLISH_TOOL="$BASE/bin/router-publish-report"
@@ -82,7 +82,7 @@ ARCHIVE_SHA256="$(awk '{print $1}' "$ARCHIVE_SHA_FILE")"
 python3 - "$FACTS" "$GENERATED_AT_UTC" "$REPOSITORY_URL" "$CLONE_COMMIT" "$CLONE_TREE" "$CLONE_FILE_COUNT" "$ARCHIVE_NAME" "$ARCHIVE_SHA256" "$ARCHIVE_B64_NAME" <<'PYFACTS'
 import json,sys
 out,ts,repo,commit,tree,count,archive,sha,b64=sys.argv[1:]
-facts={'result':'PASS_VM130_GIT_SOURCE_ARCHIVE','generated_at_utc':ts,'repository':repo,'branch':'main','commit':commit,'tree':tree,'file_count':int(count),'archive':archive,'archive_sha256':sha,'archive_base64_transport':b64,'archive_base64_encoding':'base64','archive_base64_decodes_to':archive,'source_contract':'VM130 live worktree -> VM130 bare Machine Git commit -> local bare mirror main -> VM130 exact checkout -> Git archive'}
+facts={'result':'PASS_VM130_GIT_SOURCE_ARCHIVE','generated_at_utc':ts,'repository':repo,'branch':'main','commit':commit,'tree':tree,'file_count':int(count),'archive':archive,'archive_sha256':sha,'archive_base64_transport':b64,'archive_base64_encoding':'base64','archive_base64_decodes_to':archive,'source_contract':'VM130 live worktree -> Git commit -> GitHub main -> VM130 checkout -> Git archive'}
 open(out,'w',encoding='utf-8').write(json.dumps(facts,ensure_ascii=False,indent=2)+'\n')
 PYFACTS
 log "publish atomically into canonical latest vm130-source"
