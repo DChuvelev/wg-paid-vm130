@@ -2,7 +2,7 @@
 
 router_machine_close_contract_classify() {
     local mode="$1" machine="$2" backend_rc="$3" log_file="$4" upper
-    case "$machine" in vm100|vm101|vm121|vm130) ;; *) ROUTER_MACHINE_CLOSE_CLASSIFICATION=STOP_INVALID_MACHINE; return 1 ;; esac
+    case "$machine" in vm100|vm101|vm103|vm121|vm130) ;; *) ROUTER_MACHINE_CLOSE_CLASSIFICATION=STOP_INVALID_MACHINE; return 1 ;; esac
     upper="${machine^^}"
 
     if [[ "$backend_rc" -eq 124 || "$backend_rc" -ge 128 ]]; then

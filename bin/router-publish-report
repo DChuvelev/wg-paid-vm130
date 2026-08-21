@@ -249,6 +249,7 @@ case "$KIND" in
   access-map) echo "ACCESS_MAP_URL=$PUBLIC_URL" ;;
   vm100) echo "VM100_PUBLIC_URL=$PUBLIC_URL" ;;
   vm101) echo "VM101_PUBLIC_URL=$PUBLIC_URL" ;;
+  vm103) echo "VM103_PUBLIC_URL=$PUBLIC_URL" ;;
   vm121) echo "VM121_PUBLIC_URL=$PUBLIC_URL" ;;
   vm101-model) echo "VM101_MODEL_URL=$PUBLIC_URL" ;;
   vm101-methods) echo "VM101_METHODS_URL=$PUBLIC_URL" ;;

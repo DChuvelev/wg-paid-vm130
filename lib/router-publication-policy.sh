@@ -13,6 +13,8 @@ router_publication_classify() {
 ' vm100 '*_vm100_git_source_*' ;;
       vm101_git_source_*) printf '%s	%s
 ' vm101 '*_vm101_git_source_*' ;;
+      vm103_git_source_*) printf '%s	%s
+' vm103 '*_vm103_git_source_*' ;;
       vm121_git_source_*) printf '%s	%s
 ' vm121 '*_vm121_git_source_*' ;;
       vm130_git_source_*) printf '%s	%s

@@ -6,7 +6,7 @@ MODE=--publish
 if [[ "${1:-}" == --check ]]; then MODE=--check; shift; fi
 MACHINE="${1:-}"; shift || true
 DESCRIPTION="${*:-current managed source}"
-case "$MACHINE" in vm100|vm101|vm121|vm130) ;; *) echo 'Usage: router-machine-close [--check] {vm100|vm101|vm121|vm130} "description"' >&2; exit 2 ;; esac
+case "$MACHINE" in vm100|vm101|vm103|vm121|vm130) ;; *) echo 'Usage: router-machine-close [--check] {vm100|vm101|vm103|vm121|vm130} "description"' >&2; exit 2 ;; esac
 
 BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
 PUBLIC_BASE="${ROUTER_PUBLIC_BASE_URL:-https://reports.secret-studio.ru}"; PUBLIC_BASE="${PUBLIC_BASE%/}"
