@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+BASE="${ROUTER_OPS_BASE:-/opt/router-ops}"
+TOKEN_FILE="${ROUTER_PUBLIC_TOKEN_FILE:-$BASE/public/.router-public-token}"
+KEY="${ROUTER_VM103_SSH_KEY:-/home/ops/.ssh/router_ops_ed25519}"
+HOST="${ROUTER_VM103_SSH_HOST:-ops@10.71.100.86}"
+DEST="${ROUTER_VM103_REPORTS_ROOT:-/srv/wg-paid/reports}"
+
+stop() {
+  echo 'RESULT=STOP_ROUTER_PUBLIC_MIRROR_VM103'
+  echo "STOP_CODE=$1"
+  echo "STOP_REASON=${2:-unknown}"
+  exit 1
+}
+
+for c in rsync ssh sha256sum find sort awk wc readlink python3; do
+  command -v "$c" >/dev/null 2>&1 || stop REQUIRED_COMMAND_MISSING "$c"
+done
+[[ -r "$TOKEN_FILE" ]] || stop TOKEN_FILE_MISSING "$TOKEN_FILE"
+[[ -r "$KEY" ]] || stop SSH_KEY_MISSING "$KEY"
+TOKEN="$(cat "$TOKEN_FILE")"
+[[ "$TOKEN" =~ ^[A-Za-z0-9._-]+$ ]] || stop INVALID_TOKEN_FORMAT
+SRC_ENTRY="${ROUTER_VM103_REPORTS_SOURCE_ROOT:-$BASE/public/r/$TOKEN}"
+[[ -e "$SRC_ENTRY" || -L "$SRC_ENTRY" ]] || stop SOURCE_ROOT_MISSING "$SRC_ENTRY"
+SRC_ENTRY_SYMLINK=false
+[[ -L "$SRC_ENTRY" ]] && SRC_ENTRY_SYMLINK=true
+SRC="$(readlink -f -- "$SRC_ENTRY")" || stop SOURCE_ROOT_RESOLVE_FAILED "$SRC_ENTRY"
+[[ -n "$SRC" && -d "$SRC" ]] || stop SOURCE_ROOT_RESOLVE_FAILED "$SRC_ENTRY"
+[[ -d "$SRC/latest" && -d "$SRC/old" ]] || stop SOURCE_TREE_INCOMPLETE "$SRC"
+
+# Historical machine/rootfs snapshots can legitimately contain relative
+# symlinks whose targets are absent from the archived subset. Preserve those
+# links exactly. Safety is lexical, not existence-based: absolute links are
+# forbidden and the normalized relative target must remain inside SRC.
+SYMLINK_COUNT=0
+BROKEN_SYMLINK_COUNT=0
+while IFS= read -r link; do
+  [[ -n "$link" ]] || continue
+  RAW_TARGET="$(readlink -- "$link")" || stop NESTED_SYMLINK_READ_FAILED "$link"
+  [[ "$RAW_TARGET" != /* ]] || stop NESTED_SYMLINK_ABSOLUTE_FORBIDDEN "link=$link target=$RAW_TARGET"
+  FACTS="$(python3 - "$SRC" "$link" "$RAW_TARGET" <<'PYLINK'
+import os,sys
+root=os.path.abspath(sys.argv[1])
+link=os.path.abspath(sys.argv[2])
+raw=sys.argv[3]
+lex=os.path.normpath(os.path.join(os.path.dirname(link),raw))
+try:
+    inside=os.path.commonpath([root,lex])==root
+except ValueError:
+    inside=False
+print('inside=true' if inside else 'inside=false')
+print('lexical='+lex)
+PYLINK
+)" || stop NESTED_SYMLINK_LEXICAL_CHECK_FAILED "$link"
+  INSIDE="$(printf '%s\n' "$FACTS" | awk -F= '$1=="inside"{print $2}')"
+  LEXICAL="$(printf '%s\n' "$FACTS" | awk -F= '$1=="lexical"{print substr($0,index($0,"=")+1)}')"
+  [[ "$INSIDE" == true ]] || stop NESTED_SYMLINK_ESCAPES_ROOT "link=$link target=$RAW_TARGET lexical=$LEXICAL root=$SRC"
+  [[ -e "$link" ]] || BROKEN_SYMLINK_COUNT=$((BROKEN_SYMLINK_COUNT+1))
+  SYMLINK_COUNT=$((SYMLINK_COUNT+1))
+done < <(find -P "$SRC" -mindepth 1 -type l -print | LC_ALL=C sort)
+
+SSH=(ssh -i "$KEY" -o BatchMode=yes -o ConnectTimeout=10)
+"${SSH[@]}" "$HOST" "test -d '$DEST' && test -w '$DEST' && command -v rsync >/dev/null"
+
+RSYNC_RSH="ssh -i $KEY -o BatchMode=yes -o ConnectTimeout=10"
+rsync -a --delete-delay --delay-updates --chmod=D755,F644 \
+  -e "$RSYNC_RSH" \
+  "$SRC/" "$HOST:$DEST/"
+
+tree_manifest() {
+  local root="$1"
+  (
+    cd "$root"
+    while IFS= read -r item; do
+      [[ -n "$item" ]] || continue
+      if [[ -L "$item" ]]; then
+        printf 'L\t%s\t%s\n' "$item" "$(readlink -- "$item")"
+      elif [[ -f "$item" ]]; then
+        printf 'F\t%s\t%s\n' "$item" "$(sha256sum "$item" | awk '{print $1}')"
+      elif [[ -d "$item" ]]; then
+        printf 'D\t%s\n' "$item"
+      else
+        stop UNSUPPORTED_SOURCE_ENTRY_TYPE "$root/$item"
+      fi
+    done < <(find -P . -mindepth 1 -print | LC_ALL=C sort)
+  ) | sha256sum | awk '{print $1}'
+}
+count_local="$(find -P "$SRC" -type f | wc -l | tr -d ' ')"
+hash_local="$(tree_manifest "$SRC")"
+
+REMOTE_FACTS="$("${SSH[@]}" "$HOST" bash -s -- "$DEST" <<'REMOTE_SH'
+set -Eeuo pipefail
+root="${1:?root}"
+cd "$root"
+files="$(find -P . -type f | wc -l | tr -d ' ')"
+links="$(find -P . -mindepth 1 -type l | wc -l | tr -d ' ')"
+broken="$(find -P . -mindepth 1 -type l ! -exec test -e {} \; -print | wc -l | tr -d ' ')"
+hash="$({
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    if [[ -L "$item" ]]; then
+      printf 'L\t%s\t%s\n' "$item" "$(readlink -- "$item")"
+    elif [[ -f "$item" ]]; then
+      printf 'F\t%s\t%s\n' "$item" "$(sha256sum "$item" | awk '{print $1}')"
+    elif [[ -d "$item" ]]; then
+      printf 'D\t%s\n' "$item"
+    else
+      echo "UNSUPPORTED_REMOTE_ENTRY=$item" >&2
+      exit 70
+    fi
+  done < <(find -P . -mindepth 1 -print | LC_ALL=C sort)
+} | sha256sum | awk '{print $1}')"
+printf '%s %s %s %s\n' "$files" "$links" "$broken" "$hash"
+REMOTE_SH
+)" || stop REMOTE_MANIFEST_FAILED "$HOST:$DEST"
+read -r count_remote links_remote broken_remote hash_remote <<< "$REMOTE_FACTS"
+[[ "$count_remote" == "$count_local" ]] || stop FILE_COUNT_MISMATCH "local=$count_local remote=$count_remote"
+[[ "$links_remote" == "$SYMLINK_COUNT" ]] || stop SYMLINK_COUNT_MISMATCH "local=$SYMLINK_COUNT remote=$links_remote"
+[[ "$broken_remote" == "$BROKEN_SYMLINK_COUNT" ]] || stop BROKEN_SYMLINK_COUNT_MISMATCH "local=$BROKEN_SYMLINK_COUNT remote=$broken_remote"
+[[ "$hash_remote" == "$hash_local" ]] || stop MANIFEST_HASH_MISMATCH "local=$hash_local remote=$hash_remote"
+
+echo "MIRROR_SOURCE_ENTRY=$SRC_ENTRY"
+echo "MIRROR_SOURCE_ENTRY_SYMLINK=$SRC_ENTRY_SYMLINK"
+echo "MIRROR_SOURCE_RESOLVED=$SRC"
+echo "MIRROR_NESTED_SYMLINK_COUNT=$SYMLINK_COUNT"
+echo "MIRROR_BROKEN_SYMLINK_COUNT=$BROKEN_SYMLINK_COUNT"
+echo "MIRROR_DESTINATION=$HOST:$DEST"
+echo "MIRROR_FILE_COUNT=$count_local"
+echo "MIRROR_MANIFEST_SHA256=$hash_local"
+echo 'MIRROR_SYMLINK_POLICY=RELATIVE_LEXICALLY_CONTAINED_PRESERVED'
+echo 'MIRROR_EXACT=true'
+echo 'RESULT=PASS_ROUTER_PUBLIC_MIRROR_VM103'

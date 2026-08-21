@@ -217,6 +217,32 @@ COMMITTED=1
 trap - EXIT INT TERM HUP
 rm -rf "$STAGE_ROOT"
 
+MIRROR="${ROUTER_PUBLIC_MIRROR_VM103:-$BASE/bin/router-public-mirror-vm103}"
+MIRROR_STATUS=disabled
+if [[ -x "$MIRROR" ]]; then
+    MIRROR_LOG="$BASE/state/public-mirror-vm103-last.log"
+    if "$MIRROR" > "$MIRROR_LOG" 2>&1; then
+        grep -Fqx 'RESULT=PASS_ROUTER_PUBLIC_MIRROR_VM103' "$MIRROR_LOG" || {
+            cat "$MIRROR_LOG" >&2 || true
+            echo 'RESULT=STOP_ROUTER_PUBLISH_REPORT'
+            echo 'STOP_CODE=VM103_MIRROR_CONTRACT_MISSING'
+            echo 'LOCAL_PUBLICATION_COMMITTED=true'
+            echo "MIRROR_LOG=$MIRROR_LOG"
+            exit 1
+        }
+        MIRROR_STATUS=PASS
+    else
+        rc=$?
+        cat "$MIRROR_LOG" >&2 || true
+        echo 'RESULT=STOP_ROUTER_PUBLISH_REPORT'
+        echo 'STOP_CODE=VM103_MIRROR_FAILED'
+        echo "STOP_REASON=rc_$rc"
+        echo 'LOCAL_PUBLICATION_COMMITTED=true'
+        echo "MIRROR_LOG=$MIRROR_LOG"
+        exit "$rc"
+    fi
+fi
+
 PUBLISHED_RELATIVE_PATH="latest/$FOLDER"
 PUBLIC_URL="$PUBLIC_BASE/latest/$FOLDER/"
 TRYCF_BASE="${TUNNEL_BASE:-}"
@@ -261,4 +287,5 @@ if [[ -n "$TRYCF_BASE" ]]; then
     echo "TRYCF_INDEX=$TRYCF_BASE/r/$TOKEN/latest/"
     echo "TRYCF_REPORT=$TRYCF_BASE/r/$TOKEN/latest/$FOLDER/"
 fi
+echo "VM103_REPORT_MIRROR=$MIRROR_STATUS"
 echo RESULT=PASS_ROUTER_PUBLISH_REPORT
