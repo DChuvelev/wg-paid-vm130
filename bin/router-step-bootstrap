@@ -10,30 +10,86 @@ GATE="${ROUTER_BUNDLE_GATE:-$BASE/bin/router-bundle-gate}"
 ZIP_TOOL="$BASE/bin/router-zip-contract"
 RELEASE_TOOL="$BASE/bin/router-release-contract"
 STEP="$(basename "$ZIP" .zip)"
-WORK="$(dirname "$ZIP")/.unpack-${STEP}-$$"
+INCOMING="$(dirname "$ZIP")"
+WORK="$INCOMING/.unpack-${STEP}-$$"
+STEP_STARTED=false
 EMERGENCY_HANDLED=false
+LATEST_BEFORE="$WORK/.latest-before.txt"
+LATEST_AFTER="$WORK/.latest-after.txt"
+
+source_workflow() {
+  [[ -r "$BASE/lib/router-step-workflow.sh" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$BASE/lib/router-step-workflow.sh"
+}
+snapshot_latest() {
+  local out="$1"
+  find "$INCOMING" -maxdepth 1 -type f -name 'WG_PAID_MGTS_LATEST_*.zip' -printf '%f\n' 2>/dev/null | LC_ALL=C sort > "$out" || true
+}
+new_started_latest() {
+  snapshot_latest "$LATEST_AFTER"
+  comm -13 "$LATEST_BEFORE" "$LATEST_AFTER" | tail -n1
+}
+retain_started_bundle() {
+  source_workflow || return 1
+  router_step_retain_bundle "$ZIP" "$ZIP_SHA" "$BASE" "$INCOMING"
+}
 archive_current_latest() {
-  if [[ -r "$BASE/lib/router-step-workflow.sh" ]]; then
-    source "$BASE/lib/router-step-workflow.sh"
-    router_step_archive_latest_python "$BASE" /home/ops/incoming "$(date -u +%Y%m%d-%H%M%S)" 2>/dev/null || true
+  source_workflow || return 1
+  router_step_archive_latest_python "$BASE" "$INCOMING" "$(date -u +%Y%m%d-%H%M%S)"
+}
+cleanup_old_unpacks() {
+  source_workflow || return 0
+  router_step_cleanup_stale_unpacks "$BASE" "$INCOMING" "$WORK" || true
+}
+started_stop() {
+  local rc="$1" line="$2" command="$3" newest='' retained=false
+  trap - ERR; set +e
+  echo RESULT=STOP_ROUTER_STEP_BOOTSTRAP
+  echo "STEP=$STEP"
+  echo "BOOTSTRAP_STOP_LINE=$line"
+  echo "BOOTSTRAP_STOP_RC=$rc"
+  printf 'BOOTSTRAP_STOP_COMMAND=%q\n' "$command"
+  if retain_started_bundle; then retained=true; else echo STARTED_BUNDLE_RETENTION=FAILED; fi
+  newest="$(new_started_latest 2>/dev/null || true)"
+  if [[ -n "$newest" && -f "$INCOMING/$newest" ]]; then
+    echo STARTED_ATTEMPT_LATEST_PRESENT=true
+    echo "STARTED_ATTEMPT_LATEST=$INCOMING/$newest"
+    if [[ "$retained" == true ]]; then
+      rm -rf "$WORK"
+      echo UNPACK_CLEANUP=PASS_SAFE_STOP_CLOSURE
+      cleanup_old_unpacks
+    else
+      echo "RETAINED_UNPACK_DIR=$WORK"
+    fi
+  else
+    echo STARTED_ATTEMPT_LATEST_PRESENT=false
+    archive_current_latest || true
+    echo "RETAINED_UNPACK_DIR=$WORK"
+    echo UNPACK_CLEANUP=SKIPPED_EMERGENCY_EVIDENCE
   fi
+  exit "$rc"
 }
 emergency_stop() {
   local rc="$1" line="$2" command="$3"
   trap - ERR
   [[ "$EMERGENCY_HANDLED" == false ]] || exit "$rc"
   EMERGENCY_HANDLED=true
+  if [[ "$STEP_STARTED" == true ]]; then
+    started_stop "$rc" "$line" "$command"
+  fi
   set +e
-  echo RESULT=STOP_ROUTER_STEP_BOOTSTRAP
+  echo RESULT=STOP_ROUTER_STEP_BOOTSTRAP_PRESTART
   echo "STEP=$STEP"
   echo "BOOTSTRAP_STOP_LINE=$line"
   echo "BOOTSTRAP_STOP_RC=$rc"
   printf 'BOOTSTRAP_STOP_COMMAND=%q\n' "$command"
+  echo STEP_WAS_NOT_STARTED=true
   echo "RETAINED_UNPACK_DIR=$WORK"
-  archive_current_latest
   exit "$rc"
 }
 trap 'rc=$?; emergency_stop "$rc" "$LINENO" "$BASH_COMMAND"' ERR
+
 [[ -x "$ZIP_TOOL" && -x "$RELEASE_TOOL" ]]
 [[ -f "$ZIP" ]] || { echo RESULT=STOP_COPY_OR_TRANSFER_ERROR; echo COPY_VERIFY=FAIL; echo STEP_WAS_NOT_STARTED=true; exit 20; }
 echo '>>> verify ZIP'
@@ -91,12 +147,36 @@ echo FIXTURE_VERIFY=PASS
 echo COPY_VERIFY=PASS
 echo "STEP_SHA256=$INSTALL_SHA"
 if [[ "$VERIFY_ONLY" == true ]]; then echo RESULT=PASS_ROUTER_STEP_BOOTSTRAP_VERIFY_ONLY; rm -rf "$WORK"; exit 0; fi
+
 echo ">>> start $STEP"
-set +e
-BUNDLE_ZIP="$ZIP" EXPECTED_BUNDLE_SHA256="$ZIP_SHA" EXPECTED_INSTALLER_SHA256="$INSTALL_SHA" "$DIR/install.sh"
-rc=$?
-set -e
+snapshot_latest "$LATEST_BEFORE"
+STEP_STARTED=true
+if BUNDLE_ZIP="$ZIP" EXPECTED_BUNDLE_SHA256="$ZIP_SHA" EXPECTED_INSTALLER_SHA256="$INSTALL_SHA" "$DIR/install.sh"; then
+  rc=0
+else
+  rc=$?
+fi
 echo "BOOTSTRAP_INSTALLER_RC=$rc"
-[[ "$rc" -eq 0 ]] && rm -rf "$WORK"
+if [[ "$rc" -ne 0 ]]; then
+  started_stop "$rc" "$LINENO" 'installer returned non-zero'
+fi
+
+newest="$(new_started_latest 2>/dev/null || true)"
+if [[ -z "$newest" || ! -f "$INCOMING/$newest" ]]; then
+  echo RESULT=STOP_ROUTER_STEP_BOOTSTRAP_PASS_WITHOUT_FRESH_LATEST
+  echo "STEP=$STEP"
+  retain_started_bundle || true
+  echo "RETAINED_UNPACK_DIR=$WORK"
+  trap - ERR
+  exit 74
+fi
+retain_started_bundle
+rm -rf "$WORK"
+cleanup_old_unpacks
+snapshot_latest "$LATEST_AFTER"
+latest_count="$(wc -l < "$LATEST_AFTER" | tr -d ' ')"
+echo "INCOMING_LATEST_COUNT=$latest_count"
+[[ "$latest_count" -eq 1 ]]
+echo RESULT=PASS_ROUTER_STEP_BOOTSTRAP_CLOSURE
 trap - ERR
-exit "$rc"
+exit 0

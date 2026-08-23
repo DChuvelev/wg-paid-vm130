@@ -41,3 +41,36 @@ grep -qx ROLLBACK_STATUS=completed <<<"$stop"
 grep -qx LATEST_ARCHIVE=/tmp/latest.zip <<<"$stop"
 [[ "$(wc -l < "$WORK/events.tsv")" -ge 8 ]]
 echo RESULT=PASS_ROUTER_STEP_WORKFLOW_SELFTEST
+
+# Incoming retention/hygiene regression.
+HBASE="$WORK/hygiene-base"
+HIN="$WORK/hygiene-incoming"
+mkdir -p "$HBASE/public/r/token/latest/sample" "$HIN"
+printf 'token\n' > "$HBASE/public/.router-public-token"
+printf 'current\n' > "$HBASE/public/r/token/latest/sample/report.txt"
+
+python3 - "$HIN/STEP_SELFTEST.zip" "$HIN/WG_PAID_MGTS_LATEST_19990101-000000.zip" <<'PYZIP'
+import sys,zipfile
+for path,name in [(sys.argv[1],'bundle.txt'),(sys.argv[2],'latest.txt')]:
+    with zipfile.ZipFile(path,'w') as z: z.writestr(name,'ok\n')
+PYZIP
+bundle_sha="$(sha256sum "$HIN/STEP_SELFTEST.zip" | awk '{print $1}')"
+router_step_retain_bundle "$HIN/STEP_SELFTEST.zip" "$bundle_sha" "$HBASE" "$HIN" > "$WORK/retain-bundle.log"
+grep -qx RESULT=PASS_ROUTER_STEP_RETAIN_BUNDLE "$WORK/retain-bundle.log"
+[[ ! -e "$HIN/STEP_SELFTEST.zip" ]]
+[[ -f "$HBASE/state/retained-step-zips/STEP_SELFTEST/${bundle_sha}.zip" ]]
+
+mkdir -p "$HIN/.unpack-STEP_SELFTEST-123"
+router_step_cleanup_stale_unpacks "$HBASE" "$HIN" > "$WORK/cleanup-unpack.log"
+grep -qx STALE_UNPACK_REMOVED_COUNT=1 "$WORK/cleanup-unpack.log"
+[[ ! -e "$HIN/.unpack-STEP_SELFTEST-123" ]]
+
+router_step_archive_latest_python "$HBASE" "$HIN" 20000101-000000 > "$WORK/hygiene-latest.log"
+grep -qx RESULT=PASS_ROUTER_STEP_ARCHIVE_LATEST "$WORK/hygiene-latest.log"
+grep -qx PREVIOUS_LATEST_RETAINED_COUNT=1 "$WORK/hygiene-latest.log"
+grep -qx INCOMING_LATEST_COUNT=1 "$WORK/hygiene-latest.log"
+[[ -f "$HIN/WG_PAID_MGTS_LATEST_20000101-000000.zip" ]]
+old_sha="$(find "$HBASE/state/retained-latest" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | head -n1)"
+[[ "$old_sha" =~ ^[0-9a-f]{64}$ ]]
+[[ -f "$HBASE/state/retained-latest/$old_sha/WG_PAID_MGTS_LATEST_19990101-000000.zip" ]]
+echo RESULT=PASS_ROUTER_INCOMING_RETENTION_HYGIENE_SELFTEST
