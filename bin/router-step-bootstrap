@@ -31,8 +31,33 @@ new_started_latest() {
   comm -13 "$LATEST_BEFORE" "$LATEST_AFTER" | tail -n1
 }
 retain_started_bundle() {
+  local retained actual
   source_workflow || return 1
-  router_step_retain_bundle "$ZIP" "$ZIP_SHA" "$BASE" "$INCOMING"
+  if [[ -f "$ZIP" ]]; then
+    router_step_retain_bundle "$ZIP" "$ZIP_SHA" "$BASE" "$INCOMING"
+    return $?
+  fi
+  retained="$BASE/state/retained-step-zips/$STEP/${ZIP_SHA}.zip"
+  if [[ -f "$retained" ]]; then
+    actual="$(sha256sum "$retained" | awk '{print $1}')"
+    if [[ "$actual" == "$ZIP_SHA" ]]; then
+      echo RESULT=PASS_ROUTER_STEP_RETAIN_BUNDLE_ALREADY_RETAINED
+      echo "STEP=$STEP"
+      echo "RETAINED_STEP_ZIP=$retained"
+      echo "RETAINED_STEP_ZIP_SHA256=$actual"
+      echo INCOMING_SOURCE_REMOVED=true
+      return 0
+    fi
+    echo RESULT=STOP_ROUTER_STEP_RETAIN_BUNDLE_RETAINED_SHA_MISMATCH
+    echo "STEP=$STEP"
+    echo "RETAINED_STEP_ZIP=$retained"
+    echo "EXPECTED_SHA256=$ZIP_SHA"
+    echo "ACTUAL_SHA256=$actual"
+    return 1
+  fi
+  echo RESULT=STOP_ROUTER_STEP_RETAIN_BUNDLE_MISSING
+  echo "BUNDLE=$ZIP"
+  return 1
 }
 archive_current_latest() {
   source_workflow || return 1
@@ -171,12 +196,15 @@ if [[ -z "$newest" || ! -f "$INCOMING/$newest" ]]; then
   exit 74
 fi
 retain_started_bundle
-rm -rf "$WORK"
-cleanup_old_unpacks
-snapshot_latest "$LATEST_AFTER"
+# LATEST_AFTER was populated by new_started_latest above. Validate the final
+# incoming Latest invariant while the work directory still exists; only then
+# remove work evidence. This prevents a successful STEP from deleting its own
+# .latest-after.txt before bootstrap closure bookkeeping is complete.
 latest_count="$(wc -l < "$LATEST_AFTER" | tr -d ' ')"
 echo "INCOMING_LATEST_COUNT=$latest_count"
 [[ "$latest_count" -eq 1 ]]
-echo RESULT=PASS_ROUTER_STEP_BOOTSTRAP_CLOSURE
 trap - ERR
+rm -rf "$WORK" || true
+cleanup_old_unpacks
+echo RESULT=PASS_ROUTER_STEP_BOOTSTRAP_CLOSURE
 exit 0

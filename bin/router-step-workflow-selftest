@@ -74,3 +74,23 @@ old_sha="$(find "$HBASE/state/retained-latest" -mindepth 1 -maxdepth 1 -type d -
 [[ "$old_sha" =~ ^[0-9a-f]{64}$ ]]
 [[ -f "$HBASE/state/retained-latest/$old_sha/WG_PAID_MGTS_LATEST_19990101-000000.zip" ]]
 echo RESULT=PASS_ROUTER_INCOMING_RETENTION_HYGIENE_SELFTEST
+
+# Bootstrap PASS-closure ordering/idempotent-retention regression.
+BOOTSTRAP="${ROUTER_STEP_BOOTSTRAP_UNDER_TEST:-/opt/router-ops/bin/router-step-bootstrap}"
+[[ -f "$BOOTSTRAP" ]]
+python3 - "$BOOTSTRAP" <<'PYBOOT'
+import sys
+s=open(sys.argv[1],encoding='utf-8').read()
+assert 'PASS_ROUTER_STEP_RETAIN_BUNDLE_ALREADY_RETAINED' in s
+needle='newest="$(new_started_latest 2>/dev/null || true)"'
+pos_new=s.index(needle)
+pos_retain=s.index('retain_started_bundle', pos_new)
+pos_count=s.index('latest_count="$(wc -l < "$LATEST_AFTER"', pos_retain)
+pos_trap=s.index('trap - ERR', pos_count)
+pos_rm=s.index('rm -rf "$WORK"', pos_trap)
+pos_pass=s.index('echo RESULT=PASS_ROUTER_STEP_BOOTSTRAP_CLOSURE', pos_rm)
+assert pos_new < pos_retain < pos_count < pos_trap < pos_rm < pos_pass
+segment=s[pos_retain:pos_rm]
+assert 'snapshot_latest "$LATEST_AFTER"' not in segment
+PYBOOT
+echo RESULT=PASS_ROUTER_BOOTSTRAP_POST_PASS_ORDERING_SELFTEST
