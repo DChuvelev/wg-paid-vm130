@@ -1,0 +1,16 @@
+[Unit]
+Description=WG Paid core resource warning monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ops
+Group=ops
+ExecStart=/opt/router-ops/bin/router-resource-monitor --run
+SuccessExitStatus=10 20
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/router-ops/state/resource-monitor

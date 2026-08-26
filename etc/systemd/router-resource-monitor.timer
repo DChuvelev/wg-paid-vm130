@@ -1,0 +1,12 @@
+[Unit]
+Description=Run WG Paid core resource warning monitor every 15 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+AccuracySec=1min
+Persistent=true
+Unit=router-resource-monitor.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""Central read-only resource monitor for WG Paid / MGTS core machines."""
+import argparse, fcntl, json, os, shlex, subprocess, sys, tempfile
+from pathlib import Path
+from datetime import datetime, timezone
+SCHEMA="router-resource-monitor-v1"
+STATE_DIR=Path(os.environ.get("ROUTER_RESOURCE_MONITOR_STATE_DIR","/opt/router-ops/state/resource-monitor"))
+CURRENT=STATE_DIR/"current.json"; EVENTS=STATE_DIR/"warnings.jsonl"; LOCK=STATE_DIR/"monitor.lock"
+SSH_KEY=os.environ.get("ROUTER_RESOURCE_MONITOR_SSH_KEY","/home/ops/.ssh/router_ops_ed25519")
+PVE_KEY="/root/.ssh/pve_to_openwrt_mgts_ed25519"
+THRESHOLDS={
+ "root_used_pct":{"warn":75,"crit":90},
+ "root_inode_pct":{"warn":75,"crit":90},
+ "tmp_used_pct":{"warn":50,"crit":75},
+ "journal_kb":{"warn":786432,"crit":1572864},
+ "bounded_log_bytes":{"warn":1153434,"crit":2097152},
+}
+HOSTS=("vm100","vm101","vm103","vm121","vm130")
+def now_iso(): return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00","Z")
+def run(cmd,timeout=20):
+    try:
+        p=subprocess.run(cmd,text=True,capture_output=True,timeout=timeout); return p.returncode,p.stdout,p.stderr
+    except subprocess.TimeoutExpired as e: return 124,e.stdout or "",e.stderr or "timeout"
+    except OSError as e: return 127,"",str(e)
+def parse_kv(text):
+    d={}
+    for raw in text.splitlines():
+        if "=" not in raw: continue
+        k,v=raw.split("=",1); k=k.strip(); v=v.strip()
+        if not k: continue
+        try: d[k]=int(v)
+        except ValueError: d[k]=v
+    return d
+def openwrt(ip,log_path):
+    remote=("ROOT_USED_PCT=$(df -P / | awk 'END{gsub(\"%\",\"\",$5);print $5}'); "
+            "TMP_USED_PCT=$(df -P /tmp | awk 'END{gsub(\"%\",\"\",$5);print $5}'); "
+            f"LOG_BYTES=$(wc -c < {shlex.quote(log_path)} 2>/dev/null || echo 0); "
+            "echo root_used_pct=$ROOT_USED_PCT; echo tmp_used_pct=$TMP_USED_PCT; echo bounded_log_bytes=$LOG_BYTES")
+    inner=f"ssh -n -i {PVE_KEY} -o BatchMode=yes -o ConnectTimeout=8 root@{ip} {shlex.quote(remote)}"
+    rc,o,e=run(["ssh","-o","BatchMode=yes","-o","ConnectTimeout=8","pve-mgts",inner],20); return rc,parse_kv(o),e.strip()
+def debian_remote(target,sudo=False,key=None):
+    remote=("ROOT_USED_PCT=$(df -P / | awk 'END{gsub(\"%\",\"\",$5);print $5}'); "
+            "ROOT_INODE_PCT=$(df -Pi / | awk 'END{gsub(\"%\",\"\",$5);print $5}'); "
+            "JOURNAL_KB=$(du -sk /var/log/journal 2>/dev/null | awk '{print $1}'); [ -n \"$JOURNAL_KB\" ] || JOURNAL_KB=0; "
+            "echo root_used_pct=$ROOT_USED_PCT; echo root_inode_pct=$ROOT_INODE_PCT; echo journal_kb=$JOURNAL_KB")
+    if sudo: remote="sudo -n sh -c "+shlex.quote(remote)
+    cmd=["ssh","-o","BatchMode=yes","-o","ConnectTimeout=8"]
+    if key: cmd += ["-i",key]
+    cmd += [target,remote]
+    rc,o,e=run(cmd,20); return rc,parse_kv(o),e.strip()
+def local130():
+    cmd=("ROOT_USED_PCT=$(df -P / | awk 'END{gsub(\"%\",\"\",$5);print $5}'); "
+         "ROOT_INODE_PCT=$(df -Pi / | awk 'END{gsub(\"%\",\"\",$5);print $5}'); "
+         "JOURNAL_KB=$(du -sk /var/log/journal 2>/dev/null | awk '{print $1}'); [ -n \"$JOURNAL_KB\" ] || JOURNAL_KB=0; "
+         "echo root_used_pct=$ROOT_USED_PCT; echo root_inode_pct=$ROOT_INODE_PCT; echo journal_kb=$JOURNAL_KB")
+    rc,o,e=run(["bash","-lc",cmd],10); return rc,parse_kv(o),e.strip()
+def fixture_metrics(path):
+    r={}
+    for h in HOSTS:
+        p=Path(path)/f"{h}.kv"; r[h]=(0,parse_kv(p.read_text()),"") if p.is_file() else (2,{},f"fixture_missing:{p}")
+    return r
+def collect(fixture=None):
+    if fixture: return fixture_metrics(fixture)
+    return {"vm100":openwrt("10.71.100.1","/var/log/router-wgpay-egress-local.log"),
+            "vm101":openwrt("10.71.100.2","/var/log/router-egress-health-repair.log"),
+            "vm103":debian_remote("ops@10.71.100.86",True,SSH_KEY),
+            "vm121":debian_remote("vm121"),"vm130":local130()}
+def rank(s): return {"PASS":0,"WARN":1,"CRIT":2}[s]
+def evaluate(raw):
+    hosts={}; warnings=[]; overall="PASS"
+    for h in HOSTS:
+        rc,m,err=raw[h]; hs="PASS"
+        if rc:
+            hs="WARN"; warnings.append({"host":h,"metric":"collection","severity":"WARN","value":rc,"detail":err[:160]})
+        else:
+            for metric,value in m.items():
+                if metric not in THRESHOLDS or not isinstance(value,int): continue
+                t=THRESHOLDS[metric]; sev="CRIT" if value>=t["crit"] else ("WARN" if value>=t["warn"] else None)
+                if sev:
+                    if rank(sev)>rank(hs): hs=sev
+                    warnings.append({"host":h,"metric":metric,"severity":sev,"value":value,"warn":t["warn"],"crit":t["crit"]})
+        if rank(hs)>rank(overall): overall=hs
+        hosts[h]={"reachable":rc==0,"status":hs,**m}
+        if err and rc==0: hosts[h]["stderr"]=err[:160]
+    return overall,hosts,warnings
+def atomic_json(path,obj):
+    path.parent.mkdir(parents=True,exist_ok=True)
+    fd,tmp=tempfile.mkstemp(prefix=path.name+".",dir=str(path.parent))
+    try:
+        with os.fdopen(fd,"w") as f: json.dump(obj,f,sort_keys=True,indent=2); f.write("\n"); f.flush(); os.fsync(f.fileno())
+        os.chmod(tmp,0o600); os.replace(tmp,path)
+    finally:
+        try: os.unlink(tmp)
+        except FileNotFoundError: pass
+def trim_events():
+    if not EVENTS.exists() or EVENTS.stat().st_size<=1048576: return
+    lines=EVENTS.read_text(errors="replace").splitlines()[-200:]; tmp=EVENTS.with_name(EVENTS.name+".trim")
+    tmp.write_text("\n".join(lines)+("\n" if lines else "")); os.chmod(tmp,0o600); os.replace(tmp,EVENTS)
+def append_event(doc):
+    if doc["overall"]=="PASS": return
+    trim_events()
+    with EVENTS.open("a") as f: f.write(json.dumps({"generated_at_utc":doc["generated_at_utc"],"overall":doc["overall"],"warnings":doc["warnings"]},sort_keys=True)+"\n")
+    os.chmod(EVENTS,0o600); trim_events()
+def run_monitor(fixture=None):
+    STATE_DIR.mkdir(parents=True,exist_ok=True); os.chmod(STATE_DIR,0o700)
+    with LOCK.open("a+") as lock:
+        fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        overall,hosts,warnings=evaluate(collect(fixture))
+        doc={"schema":SCHEMA,"generated_at_utc":now_iso(),"overall":overall,"thresholds":THRESHOLDS,"hosts":hosts,"warning_count":len(warnings),"warnings":warnings}
+        atomic_json(CURRENT,doc); append_event(doc)
+        print(f"RESULT={overall}_ROUTER_RESOURCE_MONITOR"); print(f"OVERALL={overall}"); print(f"WARNING_COUNT={len(warnings)}"); print(f"CURRENT={CURRENT}")
+        return {"PASS":0,"WARN":10,"CRIT":20}[overall]
+def main():
+    ap=argparse.ArgumentParser(); ap.add_argument("--run",action="store_true"); ap.add_argument("--status",action="store_true"); ap.add_argument("--fixture"); a=ap.parse_args()
+    if a.status:
+        if not CURRENT.is_file(): print("RESULT=EMPTY_ROUTER_RESOURCE_MONITOR"); return 0
+        sys.stdout.write(CURRENT.read_text()); return 0
+    if not a.run: ap.error("use --run or --status")
+    try: return run_monitor(a.fixture)
+    except BlockingIOError: print("RESULT=NOOP_ROUTER_RESOURCE_MONITOR_LOCKED"); return 0
+if __name__=="__main__": raise SystemExit(main())
