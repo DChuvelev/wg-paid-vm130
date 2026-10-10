@@ -108,8 +108,158 @@ def run_monitor(fixture=None):
         overall,hosts,warnings=evaluate(collect(fixture))
         doc={"schema":SCHEMA,"generated_at_utc":now_iso(),"overall":overall,"thresholds":THRESHOLDS,"hosts":hosts,"warning_count":len(warnings),"warnings":warnings}
         atomic_json(CURRENT,doc); append_event(doc)
+        write_capacity(fixture)
         print(f"RESULT={overall}_ROUTER_RESOURCE_MONITOR"); print(f"OVERALL={overall}"); print(f"WARNING_COUNT={len(warnings)}"); print(f"CURRENT={CURRENT}")
         return {"PASS":0,"WARN":10,"CRIT":20}[overall]
+# Capacity telemetry is a separate private snapshot, not a health/uptime verdict.
+# It runs only during the existing resource monitor's 15-minute invocation.
+CAPACITY=STATE_DIR/'capacity.json'
+PVE_CAPACITY_SCRIPT=r'''
+import json, math, subprocess, time
+from pathlib import Path
+
+def q(path, *args):
+    try:
+        p=subprocess.run(['pvesh','get',path,*args,'--output-format','json'],capture_output=True,text=True,timeout=5)
+        return json.loads(p.stdout) if p.returncode==0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+def vals(rows,key):
+    return sorted(float(r[key]) for r in rows if isinstance(r,dict) and isinstance(r.get(key),(int,float)) and math.isfinite(r[key]))
+
+def summary(rows,kind):
+    if not isinstance(rows,list): return {'status':'unavailable','points':0}
+    rows=[r for r in rows if isinstance(r,dict)]
+    ts=vals(rows,'time'); c=vals(rows,'cpu'); m=[]
+    for r in rows:
+        if isinstance(r.get('mem'),(int,float)) and isinstance(r.get('maxmem'),(int,float)) and r['maxmem']>0:
+            x=100*r['mem']/r['maxmem']
+            if math.isfinite(x): m.append(x)
+    m.sort()
+    def p95(v): return round(v[min(len(v)-1,math.ceil(.95*len(v))-1)],3) if v else None
+    out={'status':'available' if ts and c else 'partial','points':len(rows),
+         'cpu_points':len(c),'cpu_avg_pct':round(100*sum(c)/len(c),3) if c else None,
+         'cpu_p95_pct':round(100*p95(c),3) if c else None,
+         'mem_p95_pct':round(p95(m),3) if m else None,
+         'span_hours':round((ts[-1]-ts[0])/3600,2) if len(ts)>1 else None,
+         'latest_age_sec':max(0,int(time.time()-ts[-1])) if ts else None}
+    for key in ('netin','netout','diskread','diskwrite'):
+        out[key+'_p95_bytes_per_sec']=p95(vals(rows,key))
+    return out
+
+inventory=q('/cluster/resources','--type','vm')
+result={'schema':'b3-pve-rrd-v1','source_status':'available' if isinstance(inventory,list) else 'unavailable',
+        'vms':{},'nodes':{},'physical_nics':{}}
+if isinstance(inventory,list):
+    used=set()
+    for vmid in (100,101,103,130):
+        found=[x for x in inventory if isinstance(x,dict) and x.get('vmid')==vmid and x.get('type')=='qemu']
+        name='vm'+str(vmid)
+        if len(found)!=1:
+            result['vms'][name]={'status':'unknown','inventory_matches':len(found)}
+            continue
+        x=found[0];node=x.get('node')
+        if not isinstance(node,str) or not node or not node.replace('-','').replace('_','').isalnum():
+            result['vms'][name]={'status':'unknown','node_proven':False}
+            continue
+        used.add(node)
+        result['vms'][name]={'status':str(x.get('status','unknown'))[:16],'node':node,
+                 'vcpus':x.get('maxcpu') if isinstance(x.get('maxcpu'),(int,float)) else None,
+                 'allocated_memory_bytes':x.get('maxmem') if isinstance(x.get('maxmem'),int) else None,
+                 'windows':{}}
+        for window in ('day','week'):
+            result['vms'][name]['windows'][window]=summary(q(f'/nodes/{node}/qemu/{vmid}/rrddata','--timeframe',window),'vm')
+    for node in sorted(used):
+        status=q(f'/nodes/{node}/status')
+        obj={'windows':{},'host_cpu_count':None,'host_mem_used_pct':None}
+        if isinstance(status,dict):
+            obj['host_cpu_count']=(status.get('cpuinfo') or {}).get('cpus')
+            mem=status.get('memory') or {}
+            if isinstance(mem.get('used'),(int,float)) and isinstance(mem.get('total'),(int,float)) and mem['total']>0:
+                obj['host_mem_used_pct']=round(100*mem['used']/mem['total'],2)
+        for window in ('day','week'):
+            obj['windows'][window]=summary(q(f'/nodes/{node}/rrddata','--timeframe',window),'node')
+        result['nodes'][node]=obj
+    # Only physical NIC link facts; no MAC/IP/hostname beyond Proxmox node IDs.
+    for nic in sorted(Path('/sys/class/net').iterdir()):
+        if not (nic/'device').exists(): continue
+        try:
+            state=(nic/'operstate').read_text().strip();speed=int((nic/'speed').read_text().strip())
+            result['physical_nics'][nic.name]={'up':state=='up','speed_mbps':speed if speed>0 else None}
+        except (OSError,ValueError):
+            result['physical_nics'][nic.name]={'up':None,'speed_mbps':None}
+print(json.dumps(result,separators=(',',':'),allow_nan=False))
+'''
+GUEST_CAPACITY_SCRIPT=r'''
+import json, os
+from pathlib import Path
+m={}
+for line in Path('/proc/meminfo').read_text().splitlines():
+    k,_,v=line.partition(':')
+    if k in ('MemTotal','MemAvailable','SwapTotal','SwapFree'):
+        m[k]=int(v.strip().split()[0])
+total=m.get('MemTotal',0)
+res={'vcpus':os.cpu_count(),'mem_total_mib':total//1024,
+     'mem_available_mib':m.get('MemAvailable',0)//1024,
+     'mem_available_pct':round(100*m.get('MemAvailable',0)/total,2) if total else None,
+     'swap_used_mib':(m.get('SwapTotal',0)-m.get('SwapFree',0))//1024,
+     'psi_some_avg300':{}}
+for name in ('cpu','memory','io'):
+    p=Path('/proc/pressure')/name
+    try:
+        line=next((s for s in p.read_text().splitlines() if s.startswith('some ')),'')
+        item=next((s for s in line.split() if s.startswith('avg300=')),'')
+        val=float(item.split('=',1)[1]) if item else None
+        res['psi_some_avg300'][name]=val if val is not None and 0<=val<=100 else None
+    except (OSError,ValueError):res['psi_some_avg300'][name]=None
+print(json.dumps(res,separators=(',',':')))
+'''
+
+def _capacity_run(cmd, script, timeout=40):
+    try:
+        p=subprocess.run(cmd,input=script,text=True,capture_output=True,timeout=timeout)
+        if p.returncode or len(p.stdout)>65536:return {'status':'unavailable','failure_class':'command_or_size'}
+        obj=json.loads(p.stdout)
+        if not isinstance(obj,dict):return {'status':'unavailable','failure_class':'shape'}
+        return obj
+    except (OSError,ValueError,subprocess.TimeoutExpired):
+        return {'status':'unavailable','failure_class':'transport_or_json'}
+
+def collect_capacity(fixture=None):
+    if fixture:
+        p=Path(fixture)/'capacity.json'
+        if p.is_file():
+            obj=json.loads(p.read_text()); assert isinstance(obj,dict)
+            return obj
+        return {'schema':'router-capacity-snapshot-v1','generated_at_utc':now_iso(),
+                'source_status':'unavailable','pve':{'status':'fixture_absent'},'guests':{}}
+    pve=_capacity_run(['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=7','pve-mgts','python3 -'],PVE_CAPACITY_SCRIPT,40)
+    guests={}
+    endpoints={'vm103':['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=7','-i',SSH_KEY,'ops@10.71.100.86','python3 -'],
+               'vm121':['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=7','vm121','python3 -']}
+    for host,cmd in endpoints.items():
+        guests[host]=_capacity_run(cmd,GUEST_CAPACITY_SCRIPT,9)
+    guests['vm130']=_capacity_run([sys.executable,'-c',GUEST_CAPACITY_SCRIPT],'',6)
+    failures=int(pve.get('source_status')!='available')+sum('mem_available_pct' not in v for v in guests.values())
+    return {'schema':'router-capacity-snapshot-v1','generated_at_utc':now_iso(),
+            'source_status':'partial' if failures else 'available','failed_sources':failures,
+            'pve':pve,'guests':guests,
+            'interpretation':'historical_rrd_samples_not_instantaneous_link_utilization_or_uptime'}
+
+def write_capacity(fixture=None):
+    try:
+        obj=collect_capacity(fixture)
+        assert isinstance(obj,dict)
+        atomic_json(CAPACITY,obj)
+        print('CAPACITY_SNAPSHOT=WRITTEN')
+        print('CAPACITY_SOURCE_STATUS='+str(obj.get('source_status','unknown')))
+    except (OSError,ValueError,AssertionError,TypeError) as exc:
+        # Capacity collection must never turn a healthy legacy warning monitor into failed service.
+        atomic_json(CAPACITY,{'schema':'router-capacity-snapshot-v1','generated_at_utc':now_iso(),
+                              'source_status':'unavailable','failure_class':type(exc).__name__})
+        print('CAPACITY_SNAPSHOT=UNKNOWN')
+
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--run",action="store_true"); ap.add_argument("--status",action="store_true"); ap.add_argument("--fixture"); a=ap.parse_args()
     if a.status:
