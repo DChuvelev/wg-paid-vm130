@@ -1,0 +1,17 @@
+[Unit]
+Description=WG Paid MGTS read-only HMN event collector
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=ops
+Group=ops
+UMask=0077
+ExecStart=/opt/router-ops/bin/router-hmn-event-collector
+TimeoutStartSec=140
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/router-ops/state/hmn-event-collector

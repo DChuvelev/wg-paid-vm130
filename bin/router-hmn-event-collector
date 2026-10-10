@@ -1,0 +1,298 @@
+#!/usr/bin/env python3
+"""Read-only MGTS HMN log collector; sanitized, durable, at-least-once SSH delivery.
+
+Only allowlisted fields cross the source boundary into the private spool/VM121.
+Source bytes never appear in logs, exceptions or reports.
+"""
+from __future__ import annotations
+import argparse, base64, datetime as dt, hashlib, json, os, re, subprocess, sys, uuid
+from pathlib import Path
+
+ROOT = Path('/opt/router-ops/state/hmn-event-collector')
+KEY = '/opt/router-ops/state/hmn-ingest-ssh/id_ed25519'
+MAX_SOURCE = {'health': 2097152, 'recovery': 524288}
+MAX_QUEUE_BYTES = 8388608
+MAX_QUEUE_FILES = 512
+MAX_EVENTS = 128
+MAX_BATCH_BYTES = 65536
+MAX_UNKNOWN = 10000
+HEALTH = {'health_fail_first','health_fail_threshold','health_recovered','repair_success','repair_failed','repair_suppressed_cooldown'}
+RECOVERY = {'local_repair','full_pool_refresh','daily_quality','other'}
+TS_RE = re.compile(r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d+)?(?:Z|\+00:00)$')
+SLOT_RE = re.compile(r'^(?:vpn|egress)([1-5])$')
+R_HEADER = 'ts_epoch\tts_utc\tevent_type\tresult\tattempt_id\tslot\told_endpoint\tnew_endpoint\told_generation\tnew_generation\treason\tcounter_before\tcounter_after\textra'
+UTC = dt.timezone.utc
+
+def now(): return dt.datetime.now(UTC)
+def ts(t): return t.isoformat(timespec='seconds').replace('+00:00','Z')
+def date(s):
+    if not TS_RE.fullmatch(s): raise ValueError('invalid timestamp')
+    value = dt.datetime.fromisoformat(s.replace('Z','+00:00'))
+    return value.astimezone(UTC)
+def canon(o): return json.dumps(o,ensure_ascii=True,sort_keys=True,separators=(',',':')).encode()
+def digest(o): return hashlib.sha256(canon(o)).hexdigest()
+def hash_line(s): return hashlib.sha256(s.encode('utf-8',errors='replace')).hexdigest()
+def durable_write(path, data):
+    path.parent.mkdir(parents=True,exist_ok=True,mode=0o700)
+    tmp = path.with_name('.'+path.name+'.'+uuid.uuid4().hex+'.tmp')
+    fd=os.open(tmp,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    try:
+        with os.fdopen(fd,'wb') as f: f.write(data);f.flush();os.fsync(f.fileno())
+        os.replace(tmp,path)
+        dfd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+        try: os.fsync(dfd)
+        finally: os.close(dfd)
+    finally:
+        if tmp.exists(): tmp.unlink()
+def delete_durable(path):
+    path.unlink()
+    fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+def load_state(root):
+    p=root/'cursor.json'
+    if not p.exists(): return {'version':1,'health':None,'recovery':None}
+    o=json.loads(p.read_bytes())
+    if o.get('version')!=1 or not all(k in o for k in ('health','recovery')): raise ValueError('state invalid')
+    return o
+
+def decode_shell_snapshot(data):
+    # Byte-framed, bounded protocol. Source bytes may contain arbitrary text and
+    # are never printed, written to reports, or interpreted as shell arguments.
+    offset=0
+    if not data.startswith(b'HMN_SNAPSHOT_V1\n'):
+        raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+    offset=len(b'HMN_SNAPSHOT_V1\n')
+    result={}
+    for key,cap in MAX_SOURCE.items():
+        line_end=data.find(b'\n',offset,offset+64)
+        if line_end<0: raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+        hdr=data[offset:line_end]
+        prefix=key.encode('ascii')+b' '
+        digits=hdr[len(prefix):] if hdr.startswith(prefix) else b''
+        if not digits or len(digits)>10 or not digits.isdigit():
+            raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+        length=int(digits)
+        if length>cap or length<0: raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+        offset=line_end+1
+        if len(data)-offset<length: raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+        result[key]=data[offset:offset+length].decode('utf-8',errors='replace')
+        offset+=length
+    if data[offset:]!=b'END\n': raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+    return result
+
+def remote_sources():
+    # MGTS VM101 is a POSIX sh/BusyBox environment; no Python is required there.
+    # Only bounded reads of existing log files; no health probes or provider writes.
+    script=r'''set -eu
+H=/var/log/router-egress-health-repair.log
+R=/etc/router-egress-recovery/events.tsv
+for f in "$H" "$R"; do
+    test -r "$f" || exit 7
+done
+printf 'HMN_SNAPSHOT_V1\n'
+for key in health recovery; do
+    if test "$key" = health; then file="$H"; limit=2097152
+    else file="$R"; limit=524288; fi
+    size="$(wc -c < "$file")"
+    case "$size" in ''|*[!0-9]*) exit 7;; esac
+    test "$size" -le "$limit" || exit 7
+    printf '%s %s\n' "$key" "$size"
+    cat "$file" || exit 7
+done
+printf 'END\n'
+'''
+    import shlex
+    inner=['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=9',
+           '-o','StrictHostKeyChecking=yes','-i',
+           '/root/.ssh/pve_to_openwrt_mgts_ed25519','root@10.71.100.2','sh','-s']
+    cmd=['ssh','-T','-o','BatchMode=yes','-o','ConnectTimeout=9',
+         '-o','StrictHostKeyChecking=yes','pve-mgts',' '.join(map(shlex.quote,inner))]
+    try:
+        proc=subprocess.run(cmd,input=script.encode(),stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL,timeout=35,check=False)
+    except (OSError,subprocess.TimeoutExpired):
+        raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+    if proc.returncode or len(proc.stdout)>sum(MAX_SOURCE.values())+256:
+        raise RuntimeError('SOURCE_READ_UNAVAILABLE')
+    return decode_shell_snapshot(proc.stdout)
+
+def parse_health(lines,stamp):
+    events=[];unknown=0;heartbeat=0
+    for ordinal,raw in lines:
+        if raw.startswith('__ROUTER_EGRESS_HEALTH_REPAIR_LOG_TRUNCATED'): continue
+        fields=raw.split()
+        if not fields: unknown+=1;continue
+        kv=dict(p.split('=',1) for p in fields[1:] if '=' in p)
+        typ=kv.get('event','')
+        if typ=='heartbeat': heartbeat+=1;continue
+        if typ not in HEALTH: unknown+=1;continue
+        sm=SLOT_RE.fullmatch(kv.get('slot',''))
+        try: evtime=date(fields[0]);assert sm
+        except (ValueError,AssertionError): unknown+=1;continue
+        if evtime>stamp or evtime<stamp-dt.timedelta(days=90): unknown+=1;continue
+        events.append((ordinal,evtime,typ,'failed' if typ in ('health_fail_first','health_fail_threshold','repair_failed') else 'pass' if typ in ('health_recovered','repair_success') else 'other',int(sm.group(1))))
+    return events,unknown,heartbeat
+
+def parse_recovery(lines,stamp):
+    events=[];unknown=0
+    for ordinal,raw in lines:
+        cols=raw.split('\t')
+        if len(cols)!=14: unknown+=1;continue
+        try: evtime=date(cols[1])
+        except ValueError: unknown+=1;continue
+        if evtime>stamp or evtime<stamp-dt.timedelta(days=90): unknown+=1;continue
+        typ=cols[2] if cols[2] in RECOVERY else 'other'
+        sm=SLOT_RE.fullmatch(cols[5]); result=cols[3].lower()
+        result='pass' if result in ('pass','ok','success','successful') else 'failed' if result in ('fail','failed','error') else 'other'
+        events.append((ordinal,evtime,typ,result,int(sm.group(1)) if sm else None))
+    return events,unknown,0
+
+def advance(stream,content,old,stamp):
+    if not content.endswith('\n'): raise ValueError('source line incomplete')
+    lines=content.splitlines()
+    if stream=='recovery':
+        if not lines or lines[0]!=R_HEADER: raise ValueError('recovery header unsupported')
+        lines=lines[1:]
+    hashes=[hash_line(line) for line in lines]
+    is_first=old is None
+    gap=False
+    if is_first:
+        gen=uuid.uuid4().hex;epoch=uuid.uuid4().hex;start=0;ordinal_base=0
+        continuity='initial_unknown'; provenance='historical_retained_only'
+    elif stream=='recovery':
+        prior=old['all_hashes'];overlap=len(prior)
+        good=len(hashes)>=overlap and hashes[:overlap]==prior
+        if good:
+            gen=old['generation'];epoch=old['epoch'];start=overlap;ordinal_base=old['last_ordinal'];continuity='continuous';provenance='forward_live'
+        else:
+            gap=True
+    else:
+        # Exact prefix proves append even with duplicate timestamps/identical lines.
+        # On truncation, tail overlap is valid only if its location is unambiguous.
+        prior=old.get('all_hashes',[])
+        match=-1
+        if prior and len(hashes)>=len(prior) and hashes[:len(prior)]==prior:
+            match=len(prior)
+        else:
+            tail=old['tail_hashes']; matches=[]
+            if tail:
+                for idx in range(len(hashes)-len(tail),-1,-1):
+                    if hashes[idx:idx+len(tail)]==tail: matches.append(idx+len(tail))
+            if len(matches)==1: match=matches[0]
+        if match>=0:
+            gen=old['generation'];epoch=old['epoch'];start=match;ordinal_base=old['last_ordinal'];continuity='continuous';provenance='forward_live'
+        else:
+            gap=True
+    if gap:
+        gen=uuid.uuid4().hex;epoch=uuid.uuid4().hex;start=0;ordinal_base=0
+        continuity='gap_detected';provenance='historical_retained_only'
+    delta=list(enumerate(lines[start:],start=ordinal_base+1))
+    records,unknown,heartbeat=(parse_health(delta,stamp) if stream=='health' else parse_recovery(delta,stamp))
+    events=[{'source_record_index':i,'event_at_utc':ts(t),'observed_at_utc':ts(stamp),'event_type':kind,'result':result,'egress_slot':slot,'provenance':provenance} for i,t,kind,result,slot in records]
+    next_state={'generation':gen,'epoch':epoch,'last_ordinal':ordinal_base+len(delta),'tail_hashes':hashes[-64:], 'last_observed_at':ts(stamp)}
+    if len(hashes)>50000: raise ValueError('source rows exceed safe bound')
+    next_state['all_hashes']=hashes
+    return events,next_state,continuity, min(unknown,MAX_UNKNOWN),min(heartbeat,MAX_UNKNOWN),ts(date(old['last_observed_at'])) if gap else None
+
+def make_batches(stream,events,metadata,stamp):
+    state,continuity,unknown,heartbeat,first_gap=metadata
+    # Empty batch still records observation/freshness; no fake events.
+    parts=[events[i:i+100] for i in range(0,len(events),100)] or [[]]
+    out=[]
+    for i,part in enumerate(parts):
+        batch={'schema_version':1,'source_stream':stream,'source_generation':state['generation'],'source_coverage_epoch':state['epoch'], 'collected_at_utc':ts(stamp),'continuity':('continuous' if continuity=='gap_detected' and i!=len(parts)-1 else continuity),'gap_first_observed_at':first_gap if i==len(parts)-1 else None,'gap_last_observed_at':ts(stamp) if first_gap and i==len(parts)-1 else None,'unknown_lines':unknown if i==0 else 0,'heartbeat_count':heartbeat if i==0 else 0,'events':part}
+        batch['batch_id']=digest(batch)
+        if len(canon(batch))>MAX_BATCH_BYTES or len(part)>MAX_EVENTS: raise ValueError('batch bound exceeded')
+        out.append(batch)
+    return out
+
+def recover_transaction(root):
+    path=root/'pending-transaction.json'
+    if not path.exists(): return
+    obj=json.loads(path.read_bytes())
+    if obj.get('schema')!=1: raise ValueError('transaction version')
+    for filename,batch in obj['pending']:
+        p=root/'spool'/filename
+        data=canon(batch)+b'\n'
+        if p.exists():
+            if p.read_bytes()!=data: raise ValueError('spool collision')
+        else: durable_write(p,data)
+    durable_write(root/'cursor.json',canon(obj['next_state'])+b'\n')
+    delete_durable(path)
+
+def queue_capacity(root,pending):
+    files=list((root/'spool').glob('*.json'))
+    bytes_now=sum(x.stat().st_size for x in files)
+    future_bytes=sum(len(canon(b))+1 for _,b in pending)
+    if len(files)+len(pending)>MAX_QUEUE_FILES or bytes_now+future_bytes>MAX_QUEUE_BYTES: raise RuntimeError('SPOOL_FULL')
+
+def collect(root,sources,stamp):
+    current=load_state(root);next_state=dict(current);pending=[]
+    for stream in ('health','recovery'):
+        events,state,continuity,unknown,heartbeat,gap_start=advance(stream,sources[stream],current[stream],stamp)
+        batches=make_batches(stream,events,(state,continuity,unknown,heartbeat,gap_start),stamp)
+        next_state[stream]=state
+        for i,batch in enumerate(batches):
+            filename=f'{stamp:%Y%m%d%H%M%S}-{stream}-{i:04d}-{batch["batch_id"]}.json'
+            pending.append([filename,batch])
+    queue_capacity(root,pending)
+    durable_write(root/'pending-transaction.json',canon({'schema':1,'pending':pending,'next_state':next_state})+b'\n')
+    recover_transaction(root)
+    return len(pending)
+
+def deliver(root):
+    sent=0
+    for entry in sorted((root/'spool').glob('*.json')):
+        payload=entry.read_bytes()
+        if len(payload)>MAX_BATCH_BYTES: raise RuntimeError('SPOOL_CORRUPT')
+        batch=json.loads(payload)
+        if digest({k:v for k,v in batch.items() if k!='batch_id'})!=batch['batch_id']: raise RuntimeError('SPOOL_CORRUPT')
+        cmd=['ssh','-T','-o','BatchMode=yes','-o','IdentitiesOnly=yes','-o','IdentityAgent=none','-o','StrictHostKeyChecking=yes','-o','ConnectTimeout=10','-o','ConnectionAttempts=1','-o','ClearAllForwardings=yes','-o','PreferredAuthentications=publickey','-o','PasswordAuthentication=no','-o','KbdInteractiveAuthentication=no','-i',KEY,'-l','hmn-ingest','vm121']
+        try: proc=subprocess.run(cmd,input=payload,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=50,check=False)
+        except (OSError,subprocess.TimeoutExpired): raise RuntimeError('DELIVERY_UNAVAILABLE')
+        if proc.returncode or len(proc.stdout)>2048: raise RuntimeError('DELIVERY_UNAVAILABLE')
+        try:
+            ack=json.loads(proc.stdout)
+            if set(ack)!={'status','events_added'} or ack['status'] not in ('accepted','duplicate') or type(ack['events_added']) is not int or not 0<=ack['events_added']<=128:
+                raise ValueError('invalid ACK')
+        except (ValueError,TypeError): raise RuntimeError('ACK_INVALID')
+        delete_durable(entry);sent+=1
+    return sent
+
+def main():
+    import fcntl
+    p=argparse.ArgumentParser();p.add_argument('--state-dir',type=Path,default=ROOT);p.add_argument('--fixture-source',type=Path);p.add_argument('--no-deliver',action='store_true');a=p.parse_args()
+    root=a.state_dir
+    if root.is_symlink(): raise RuntimeError('STATE_SYMLINK')
+    root.mkdir(parents=True,exist_ok=True,mode=0o700);os.chmod(root,0o700)
+    (root/'spool').mkdir(exist_ok=True,mode=0o700);os.chmod(root/'spool',0o700)
+    fd=os.open(root/'collector.lock',os.O_CREAT|os.O_RDWR,0o600)
+    with os.fdopen(fd,'r+') as lock:
+        try: fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: print('RESULT=SKIP_COLLECTOR_ALREADY_RUNNING');return 0
+        try:
+            recover_transaction(root)
+            # Retry durable backlog even if the upstream MGTS source is currently unreachable.
+            prior_acked=0
+            if not a.no_deliver:
+                try: prior_acked=deliver(root)
+                except RuntimeError: pass  # preserve and retry oldest-first after current collection
+            if a.fixture_source:
+                raw=json.loads(a.fixture_source.read_bytes())
+                if set(raw)!=set(MAX_SOURCE) or not all(isinstance(x,str) for x in raw.values()): raise ValueError('fixture source')
+            else: raw=remote_sources()
+            added=collect(root,raw,now())
+            sent=0 if a.no_deliver else prior_acked+deliver(root)
+            print('RESULT=PASS_HMN_COLLECTION')
+            print(f'BATCHES_QUEUED={added}')
+            print(f'BATCHES_ACKED={sent}')
+            print(f'SPOOL_COUNT={len(list((root/"spool").glob("*.json")))}')
+            return 0
+        except Exception as exc:
+            # Error class only, never external process output / raw source / batch data.
+            print('RESULT=STOP_HMN_COLLECTION')
+            print('ERROR_CLASS='+ ('SPOOL_FULL' if str(exc)=='SPOOL_FULL' else 'SSH_OR_SOURCE_UNAVAILABLE' if isinstance(exc,(OSError,subprocess.TimeoutExpired)) or str(exc) in ('SOURCE_READ_UNAVAILABLE','DELIVERY_UNAVAILABLE') else 'ACK_INVALID' if str(exc)=='ACK_INVALID' else 'SOURCE_OR_STATE_INVALID'))
+            return 1
+if __name__=='__main__':
+    raise SystemExit(main())
