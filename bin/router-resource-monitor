@@ -109,6 +109,7 @@ def run_monitor(fixture=None):
         doc={"schema":SCHEMA,"generated_at_utc":now_iso(),"overall":overall,"thresholds":THRESHOLDS,"hosts":hosts,"warning_count":len(warnings),"warnings":warnings}
         atomic_json(CURRENT,doc); append_event(doc)
         write_capacity(fixture)
+        if fixture is None: deliver_capacity()
         print(f"RESULT={overall}_ROUTER_RESOURCE_MONITOR"); print(f"OVERALL={overall}"); print(f"WARNING_COUNT={len(warnings)}"); print(f"CURRENT={CURRENT}")
         return {"PASS":0,"WARN":10,"CRIT":20}[overall]
 # Capacity telemetry is a separate private snapshot, not a health/uptime verdict.
@@ -259,6 +260,155 @@ def write_capacity(fixture=None):
         atomic_json(CAPACITY,{'schema':'router-capacity-snapshot-v1','generated_at_utc':now_iso(),
                               'source_status':'unavailable','failure_class':type(exc).__name__})
         print('CAPACITY_SNAPSHOT=UNKNOWN')
+
+
+# Restricted B3B4 delivery. Converts the private diagnostic snapshot into the
+# VM121 capacity-ingest-v1 allowlist. No raw RRD JSON or host metadata crosses SSH.
+CAPACITY_DELIVERY_ACK=STATE_DIR/'capacity-delivery-ack.json'
+CAPACITY_DELIVERY_KEY=Path('/opt/router-ops/state/capacity-ingest-ssh/id_ed25519')
+CAPACITY_DELIVERY_MAX=32768
+CAPACITY_ALLOWED_STATES=('available','partial','unavailable','unknown')
+CAPACITY_WINDOW_LIMITS={
+ 'cpu_avg_pct':100,'cpu_p95_pct':100,'mem_p95_pct':100,
+ 'netin_p95_bytes_per_sec':1e12,'netout_p95_bytes_per_sec':1e12,
+ 'diskread_p95_bytes_per_sec':1e12,'diskwrite_p95_bytes_per_sec':1e12,
+ 'latest_age_sec':86400*8,'points':100000,
+}
+CAPACITY_GUEST_LIMITS={
+ 'mem_total_mib':1e8,'mem_available_mib':1e8,'mem_available_pct':100,
+ 'swap_used_mib':1e8,'psi_cpu_avg300':100,'psi_memory_avg300':100,
+ 'psi_io_avg300':100,
+}
+def _cap_number(v,limit,integer=False):
+    import math
+    if type(v) not in (float,int) or not math.isfinite(v) or not 0<=v<=limit:
+        return None
+    if integer and type(v) is not int:return None
+    return v
+
+def _cap_state(s):
+    return s if s in CAPACITY_ALLOWED_STATES else 'unknown'
+
+def _cap_window(item):
+    raw=item if isinstance(item,dict) else {}
+    out={'status':_cap_state(raw.get('status'))}
+    for name,limit in CAPACITY_WINDOW_LIMITS.items():
+        out[name]=_cap_number(raw.get(name),limit,integer=name in ('points','latest_age_sec'))
+    if out['status']=='available' and (out['points'] is None or out['cpu_avg_pct'] is None):
+        out['status']='partial'
+    return out
+
+def build_capacity_delivery(snapshot):
+    if not isinstance(snapshot,dict) or snapshot.get('schema')!='router-capacity-snapshot-v1':
+        raise ValueError('unexpected source schema')
+    stamp=snapshot.get('generated_at_utc')
+    if not isinstance(stamp,str):raise ValueError('missing timestamp')
+    # The receiving side additionally enforces UTC format and 7-day recency.
+    pve=snapshot.get('pve') if isinstance(snapshot.get('pve'),dict) else {}
+    pve_vms=pve.get('vms') if isinstance(pve.get('vms'),dict) else {}
+    vms={}
+    for ident in ('vm100','vm101','vm103','vm130'):
+        vm=pve_vms.get(ident) if isinstance(pve_vms.get(ident),dict) else {}
+        windows=vm.get('windows') if isinstance(vm.get('windows'),dict) else {}
+        day=_cap_window(windows.get('day'));week=_cap_window(windows.get('week'))
+        # A VM marked running in Proxmox is not proof of tunnel health.
+        status='available' if vm.get('status')=='running' else 'unknown'
+        if day['status']!='available' or week['status']!='available':
+            status='partial' if status=='available' else 'unavailable'
+        vms[ident]={'status':status,'vcpus':_cap_number(vm.get('vcpus'),128,integer=True),
+                     'day':day,'week':week}
+    raw_guests=snapshot.get('guests') if isinstance(snapshot.get('guests'),dict) else {}
+    guests={}
+    for ident in ('vm103','vm121','vm130'):
+        raw=raw_guests.get(ident) if isinstance(raw_guests.get(ident),dict) else {}
+        psi=raw.get('psi_some_avg300') if isinstance(raw.get('psi_some_avg300'),dict) else {}
+        out={'status':'available' if 'mem_available_pct' in raw else 'unavailable'}
+        for key,limit in CAPACITY_GUEST_LIMITS.items():
+            if key.startswith('psi_'):
+                rawkey=key[4:-7] # psi_cpu_avg300 -> cpu
+                val=psi.get(rawkey)
+            else:val=raw.get(key)
+            out[key]=_cap_number(val,limit,integer=key in ('mem_total_mib','mem_available_mib','swap_used_mib'))
+        if out['status']=='available' and out['mem_available_pct'] is None:out['status']='partial'
+        guests[ident]=out
+    nodes=pve.get('nodes') if isinstance(pve.get('nodes'),dict) else {}
+    # Avoid guessing when host inventory changes: only one proven PVE node.
+    item=next(iter(nodes.values())) if len(nodes)==1 else {}
+    if not isinstance(item,dict):item={}
+    windows=item.get('windows') if isinstance(item.get('windows'),dict) else {}
+    day=_cap_window(windows.get('day'));week=_cap_window(windows.get('week'))
+    node={'status':'available' if item and day['status']=='available' and week['status']=='available' else 'partial' if item else 'unknown',
+          'cpu_count':_cap_number(item.get('host_cpu_count'),256,integer=True),
+          'mem_used_pct':_cap_number(item.get('host_mem_used_pct'),100),
+          'day_cpu_avg_pct':day['cpu_avg_pct'],'week_cpu_avg_pct':week['cpu_avg_pct']}
+    nics=pve.get('physical_nics') if isinstance(pve.get('physical_nics'),dict) else {}
+    up=[n for n in nics.values() if isinstance(n,dict) and n.get('up') is True]
+    if len(up)==1:
+        nic={'status':'available','link_up':True,'link_mbps':_cap_number(up[0].get('speed_mbps'),1e6,integer=True)}
+    elif len(up)>1:
+        nic={'status':'partial','link_up':True,'link_mbps':None}
+    elif nics:
+        nic={'status':'partial','link_up':False,'link_mbps':None}
+    else:nic={'status':'unknown','link_up':None,'link_mbps':None}
+    source_status=_cap_state(snapshot.get('source_status'))
+    if source_status=='available' and (any(x['status']!='available' for x in vms.values()) or
+                                       any(x['status']!='available' for x in guests.values()) or
+                                       node['status']!='available' or nic['status']!='available'):
+        source_status='partial'
+    return {'schema':'wg-capacity-delivery-v1','source':'vm130_resource_monitor',
+            'generated_at_utc':stamp,'source_status':source_status,
+            'vms':vms,'guests':guests,'node':node,'nic':nic}
+
+def _cap_bytes(doc):
+    import hashlib
+    raw=(json.dumps(doc,sort_keys=True,separators=(',',':'),allow_nan=False)+'\n').encode()
+    if len(raw)>CAPACITY_DELIVERY_MAX:raise ValueError('delivery limit')
+    return raw,hashlib.sha256(raw).hexdigest()
+
+def validate_capacity_ack(raw,code,expected):
+    if code!=0 or len(raw)>512:raise ValueError('ssh or ack length')
+    try: a=json.loads(raw)
+    except (TypeError,ValueError,UnicodeError):raise ValueError('bad ack json') from None
+    if not isinstance(a,dict) or set(a)!=set(('status','sha256')):
+        raise ValueError('bad ack shape')
+    if a['sha256']!=expected or a['status'] not in ('accepted','duplicate'):
+        raise ValueError('ack mismatch')
+    return a['status']
+
+def deliver_capacity_snapshot(*,runner=None,capacity_path=None,key=None,ack_path=None):
+    import hashlib,stat as statmod
+    p=capacity_path or CAPACITY
+    k=key or CAPACITY_DELIVERY_KEY
+    dest=ack_path or CAPACITY_DELIVERY_ACK
+    st=p.lstat()
+    if not statmod.S_ISREG(st.st_mode) or st.st_size>262144 or st.st_size==0 or st.st_mode&0o077:
+        raise ValueError('unsafe snapshot')
+    doc=build_capacity_delivery(json.loads(p.read_bytes()))
+    payload,digest=_cap_bytes(doc)
+    st=k.lstat()
+    if not statmod.S_ISREG(st.st_mode) or st.st_mode&0o077:raise ValueError('unsafe identity')
+    cmd=['ssh','-T','-o','User=capacity-ingest','-o','IdentitiesOnly=yes',
+         '-o','IdentityAgent=none','-o','BatchMode=yes',
+         '-o','StrictHostKeyChecking=yes','-o','ClearAllForwardings=yes',
+         '-o','ConnectTimeout=8','-o','ConnectionAttempts=1',
+         '-o','PreferredAuthentications=publickey','-o','PasswordAuthentication=no',
+         '-o','KbdInteractiveAuthentication=no','-i',str(k),'vm121']
+    if runner is None:
+        result=subprocess.run(cmd,input=payload,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL,timeout=18)
+    else:result=runner(cmd,payload)
+    ack=validate_capacity_ack(result.stdout,result.returncode,digest)
+    atomic_json(dest,{'schema':'router-capacity-delivery-ack-v1',
+                       'source_generated_at_utc':doc['generated_at_utc'],
+                       'acknowledged_at_utc':now_iso(),'status':ack,'sha256':digest})
+    return ack
+
+def deliver_capacity():
+    # Delivery errors never fail or change the legacy warning-monitor verdict.
+    try:
+        result=deliver_capacity_snapshot()
+        print('CAPACITY_DELIVERY='+result.upper())
+    except (OSError,ValueError,TypeError,UnicodeError,subprocess.TimeoutExpired):
+        print('CAPACITY_DELIVERY=DEFERRED')
 
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--run",action="store_true"); ap.add_argument("--status",action="store_true"); ap.add_argument("--fixture"); a=ap.parse_args()
