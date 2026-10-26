@@ -14,7 +14,8 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) out="$2"; shift 2 ;;
     -w) write="$2"; shift 2 ;;
-    --resolve|--connect-timeout|--max-time) shift 2 ;;
+    --resolve) printf "%s\n" "$2" >> "${FAKE_RESOLVE_LOG:-/dev/null}"; shift 2 ;;
+    --connect-timeout|--max-time) shift 2 ;;
     --silent|--show-error|--location) shift ;;
     *) url="$1"; shift ;;
   esac
@@ -35,4 +36,40 @@ rc=$?
 set -e
 [[ "$rc" -ne 0 ]]
 grep -qx RESULT=STOP_ROUTER_HTTP_VERIFY "$WORK/fail.log"
+
+# Production reports-domain default and explicit override must be covered.
+# Unset inherited variables: a caller-supplied override must not mask a bad default.
+: > "$COUNTER"
+: > "$WORK/default-resolve.log"
+env -u ROUTER_HTTP_HOST -u ROUTER_HTTP_RESOLVE_IP \
+ FAKE_COUNTER="$COUNTER" FAKE_GOOD="$GOOD" FAKE_RESOLVE_LOG="$WORK/default-resolve.log" \
+ ROUTER_HTTP_CURL_BIN="$WORK/fake-curl" \
+ "$TOOL" --url 'https://reports.secret-studio.ru/latest/' --retries 2 --delay 0 \
+ > "$WORK/default.log" 2>&1
+grep -qx RESULT=PASS_ROUTER_HTTP_VERIFY "$WORK/default.log"
+test "$(wc -l < "$WORK/default-resolve.log")" -eq 1
+grep -Fxq 'reports.secret-studio.ru:443:10.71.100.86' "$WORK/default-resolve.log"
+echo CHECK=PASS_REPORTS_DEFAULT_VM103_RESOLVE
+
+: > "$COUNTER"
+: > "$WORK/override-resolve.log"
+FAKE_COUNTER="$COUNTER" FAKE_GOOD="$GOOD" FAKE_RESOLVE_LOG="$WORK/override-resolve.log" \
+ ROUTER_HTTP_CURL_BIN="$WORK/fake-curl" ROUTER_HTTP_RESOLVE_IP='10.71.100.84' \
+ "$TOOL" --url 'https://reports.secret-studio.ru/latest/' --retries 2 --delay 0 \
+ > "$WORK/override.log" 2>&1
+grep -qx RESULT=PASS_ROUTER_HTTP_VERIFY "$WORK/override.log"
+test "$(wc -l < "$WORK/override-resolve.log")" -eq 1
+grep -Fxq 'reports.secret-studio.ru:443:10.71.100.84' "$WORK/override-resolve.log"
+echo CHECK=PASS_EXPLICIT_OVERRIDE_PRESERVED
+
+: > "$COUNTER"
+: > "$WORK/unrelated-resolve.log"
+FAKE_COUNTER="$COUNTER" FAKE_GOOD="$GOOD" FAKE_RESOLVE_LOG="$WORK/unrelated-resolve.log" \
+ ROUTER_HTTP_CURL_BIN="$WORK/fake-curl" \
+ "$TOOL" --url 'https://example.invalid/latest/' --retries 2 --delay 0 \
+ > "$WORK/unrelated.log" 2>&1
+grep -qx RESULT=PASS_ROUTER_HTTP_VERIFY "$WORK/unrelated.log"
+test ! -s "$WORK/unrelated-resolve.log"
+echo CHECK=PASS_NO_UNRELATED_RESOLVE
+
 echo RESULT=PASS_ROUTER_HTTP_VERIFY_SELFTEST
