@@ -1,0 +1,18 @@
+[Unit]
+Description=WG Paid B4D read-only diagnostics queue worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ops
+Group=ops
+WorkingDirectory=/home/ops
+Environment=HOME=/home/ops
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/router-ops/bin/router-b4d-diagnostics-once --once
+TimeoutStartSec=240s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/ops

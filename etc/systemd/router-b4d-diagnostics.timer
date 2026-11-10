@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll WG Paid B4D diagnostic queue every minute
+
+[Timer]
+OnActiveSec=90s
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Persistent=false
+Unit=router-b4d-diagnostics.service
+
+[Install]
+WantedBy=timers.target
