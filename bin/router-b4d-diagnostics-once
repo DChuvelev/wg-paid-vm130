@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+umask 077
+[[ "$(id -un)" == ops ]] || { echo RESULT=STOP_B4D_R02_OPS_REQUIRED; exit 2; }
+[[ "$#" -eq 1 ]] || { echo RESULT=STOP_B4D_R02_EXPLICIT_ACTION_REQUIRED; exit 2; }
+case "$1" in --once|--self-test) ;; *) echo RESULT=STOP_B4D_R02_INVALID_ACTION; exit 2;; esac
+exec python3 /opt/router-ops/libexec/b4d/b4d_worker_once.py "$1"
