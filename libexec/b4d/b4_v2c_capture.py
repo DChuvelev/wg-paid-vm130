@@ -297,7 +297,68 @@ def collect_extra(vm121,resources,capacity,now):
                              'sources':['vm121.runtime'],
                              'summary':f'{conflicts} conflicting observations in latest closed minute; not distinct users',
                              'read_only_direction':'Inspect runtime sample parity and per-selector aggregate history'})
+    # Interpret only *fresh* observations. The VM130 resource-monitor status
+    # is the authority for its own thresholds; the diagnostic collector must
+    # not independently turn a journal size into a network outage verdict.
+    res=observed.get('vm130.resources')
+    if status.get('vm130.resources')=='fresh' and res:
+        host=res.get('hosts',{}).get('vm130',{})
+        resource_status=host.get('status')
+        if resource_status in ('WARN','CRIT'):
+            journal=host.get('journal_kb')
+            detail=f'; journal_kb={journal}' if journal is not None else ''
+            findings.append({'code':'VM130_RESOURCE_MONITOR_'+resource_status,
+                             'severity':'warning' if resource_status=='WARN' else 'critical',
+                             'confidence':'high','sources':['vm130.resources'],
+                             'summary':f'VM130 resource monitor reports {resource_status}{detail}; resource status, not VPN reachability',
+                             'read_only_direction':'Review the existing VM130 resource-monitor warning and its own threshold policy'})
+
+    # These counters aggregate observations over 24h. They do NOT describe
+    # active conflicts in the latest minute, affected users, or an outage.
+    if status.get('vm121.runtime')=='fresh' and rt:
+        w24=rt.get('window24') or {}
+        minutes=w24.get('observed_minutes')
+        if minutes is not None and minutes>0:
+            conflicts=w24.get('conflicted_observations')
+            partial=w24.get('partial_minutes')
+            if conflicts is not None and conflicts>0:
+                findings.append({'code':'RUNTIME_HISTORY_24H_CONFLICTS','severity':'warning',
+                                 'confidence':'high','sources':['vm121.runtime'],
+                                 'summary':f'24h historical window: {conflicts} conflicting observations across {minutes} observed minutes; not current conflicts or distinct users',
+                                 'read_only_direction':'Review VM121 historical aggregates; separately inspect the latest closed minute for current state'})
+            if partial is not None and partial>0:
+                findings.append({'code':'RUNTIME_HISTORY_24H_PARTIAL','severity':'warning',
+                                 'confidence':'high','sources':['vm121.runtime'],
+                                 'summary':f'24h historical window: {partial} partial-coverage minutes out of {minutes} observed; not a claim of current outage',
+                                 'read_only_direction':'Review VM121 retained minute coverage and source continuity; do not infer client impact'})
     return sources,observed,findings
+
+
+def history_tail_findings(sources,observations,truncated_sources):
+    """Collector-size limits, never evidence of lost remote log bytes."""
+    states={s['id']:s['freshness'] for s in sources}
+    result=[]
+    key='vm101.recovery_events'
+    obj=observations.get(key)
+    if key in truncated_sources and states.get(key)=='fresh' and isinstance(obj,dict) and obj.get('truncated') is True:
+        limit=obj.get('tail_limit_lines'); total=obj.get('source_total_lines')
+        if (isinstance(limit,int) and not isinstance(limit,bool) and limit>0 and
+                isinstance(total,int) and not isinstance(total,bool) and total>limit):
+            result.append({'code':'RECOVERY_HISTORY_BOUNDED_TAIL','severity':'info',
+                           'confidence':'high','sources':[key],
+                           'summary':f'VM101 recovery-event collector tail: last {limit} of {total} source lines; truncated view, not lost source logs',
+                           'read_only_direction':'Treat this as an explicit collector history limit; do not infer missing log files or current recovery failures'})
+    return result
+
+
+def dedupe_findings(findings):
+    """Preserve source-order evidence but never repeat the same code/source."""
+    seen=set();unique=[]
+    for item in findings:
+        key=(item['code'],tuple(item['sources']))
+        if key not in seen:
+            seen.add(key);unique.append(item)
+    return unique
 
 
 def generate(fetch,vm121,resources,capacity,output,synthetic_fixture=False):
@@ -305,7 +366,8 @@ def generate(fetch,vm121,resources,capacity,output,synthetic_fixture=False):
     sources,observations,events,truncated=base.make_snapshot(fetch,now)
     extra_sources,extra_obs,extra_findings=collect_extra(vm121,resources,capacity,now)
     sources.extend(extra_sources);observations.update(extra_obs)
-    findings=base.find(sources,observations)+extra_findings
+    findings=dedupe_findings(base.find(sources,observations)+extra_findings+
+                             history_tail_findings(sources,observations,truncated))
     health='unknown'
     snapshot={'schema_version':SCHEMA,'synthetic_fixture':synthetic_fixture,'captured_at':base.time_iso(now),
               'capture_status':'partial' if any(s['freshness']!='fresh' for s in sources) else 'complete_for_review_scope',
@@ -323,7 +385,7 @@ def generate(fetch,vm121,resources,capacity,output,synthetic_fixture=False):
     for key in ('vm121.api','vm121.runtime','vm130.resources','vm130.capacity'):
         text+='\n- `'+key+'`: '+json.dumps(observations.get(key),ensure_ascii=False,sort_keys=True)+'\n'
     text+='\n## Ограничения B4/v2c review\n- История bridge-start/confirm/clear не содержит гарантированных меток времени в доступном источнике; историческая причинность не заявляется.\n- Нет атомарности между машинами; VM121 последняя закрытая минута не является текущим 5-секундным снимком.\n- Не выполняются активные VPN-пробы, исправления или изменения БД.\n'
-    payload={'README.md':b'# B4 v2c READ-ONLY review\n\nNot an installed admin button. No raw user rows, secrets, logs or private endpoints.\n',
+    payload={'README.md':b'# B4D read-only diagnostics (Admin browser)\n\nGenerated by the installed Admin Diagnostics worker; available for download in the authenticated Admin Monitoring page. Review-scope snapshot, not an end-to-end health verdict. No raw user rows, secrets, logs or private endpoints.\n',
              'report.md':text.encode(),'snapshot.json':j(snapshot),
              'events.jsonl':b''.join((json.dumps(e,ensure_ascii=False,sort_keys=True,separators=(',',':'))+'\n').encode() for e in events)}
     manifest={'schema_version':SCHEMA,'capture_started_at':base.time_iso(now),'capture_finished_at':base.time_iso(),
